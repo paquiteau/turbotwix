@@ -17,7 +17,17 @@ import subprocess
 import sys
 
 _READ_CODE = {
-    "turbotwix": ("import turbotwix as tw\ns = tw.read_twix(path)\ns.image[:]\n"),
+    # turbotwix returns lines, the references return a dense counter-indexed array, so
+    # the comparable operation is read + fold onto the grid.
+    "turbotwix": (
+        "import turbotwix as tw\n"
+        "m = tw.open_twix(path)[-1]\n"
+        "lines = m.lines.image\n"
+        "tw.to_dense(m.read(lines), lines, ('Lin', 'Rep'))\n"
+    ),
+    "turbotwix-lines": (
+        "import turbotwix as tw\nm = tw.open_twix(path)[-1]\nm.read(m.lines.image)\n"
+    ),
     "pymapvbvd": (
         "import mapvbvd\n"
         "t = mapvbvd.mapVBVD(path, quiet=True)\n"

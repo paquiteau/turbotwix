@@ -1,99 +1,105 @@
 import numpy as np
+import pytest
+from conftest import build, make_line
 
-from turbotwix import _extract, _format, _read
+from turbotwix import _extract, _format
+from turbotwix._format import Flag
 
-NCOL, NCHA = 2, 2
-
-
-def _make_line(lin: int, base: int, eval_mask: int = 0) -> tuple[bytes, np.ndarray]:
-    h = np.zeros(1, dtype=_format.VD_SCAN_HEADER)[0]
-    h["SamplesInScan"] = NCOL
-    h["UsedChannels"] = NCHA
-    h["EvalInfoMask"] = eval_mask
-    h["Counter"]["Lin"] = lin
-    buf = h.tobytes()
-    data = np.zeros((NCHA, NCOL), dtype="<c8")
-    for c in range(NCHA):
-        for s in range(NCOL):
-            data[c, s] = complex(base + c * 10 + s, 0)
-        ch = np.zeros(1, dtype=_format.VD_CHANNEL_HEADER)[0]
-        buf += ch.tobytes()
-        buf += data[c].tobytes()
-    return buf, data
+VD = _format.TwixVersion.VD
 
 
-def _build_test_table():
-    buf0, d0 = _make_line(lin=0, base=100)
-    buf1, d1 = _make_line(lin=1, base=200)
-    buf2, d2 = _make_line(lin=1, base=300)  # duplicate Lin -> must be averaged with d1
-    reflect_bit = 1 << _format.MASK_BIT["REFLECT"]
-    buf3, d3 = _make_line(lin=2, base=400, eval_mask=reflect_bit)
+def test_read_lines_returns_file_order_samples():
+    mm, table, expected = build([(4, 2, 100, 0), (4, 2, 200, 0), (4, 2, 300, 0)])
+    got = _extract.read_lines(mm, table, VD)
+    assert got.shape == (3, 2, 4)
+    assert got.dtype == np.complex64
+    np.testing.assert_array_equal(got, np.stack(expected))
 
-    raw = buf0 + buf1 + buf2 + buf3
+
+def test_read_lines_unreflects_by_default():
+    mm, table, expected = build([(4, 2, 100, 0), (4, 2, 200, int(Flag.REFLECT))])
+    np.testing.assert_array_equal(
+        _extract.read_lines(mm, table, VD), np.stack([expected[0], expected[1][:, ::-1]])
+    )
+    np.testing.assert_array_equal(
+        _extract.read_lines(mm, table, VD, reflect=False), np.stack(expected)
+    )
+
+
+def test_read_lines_into_caller_buffer():
+    mm, table, expected = build([(4, 2, 100, 0), (4, 2, 200, 0)])
+    out = np.zeros((2, 2, 4), dtype=np.complex64)
+    got = _extract.read_lines(mm, table, VD, out=out)
+    assert got is out
+    np.testing.assert_array_equal(out, np.stack(expected))
+
+    with pytest.raises(ValueError, match="out must be"):
+        _extract.read_lines(mm, table, VD, out=np.zeros((2, 2, 4), dtype=np.complex128))
+
+
+def test_read_lines_rejects_mixed_shapes():
+    mm, table, _ = build([(4, 2, 100, 0), (8, 2, 200, 0)])
+    with pytest.raises(ValueError, match="mixes line shapes"):
+        _extract.read_lines(mm, table, VD)
+    # ... and reading each shape separately works.
+    assert _extract.read_lines(mm, table[table["ncol"] == 4], VD).shape == (1, 2, 4)
+
+
+def test_read_lines_empty_selection():
+    mm, table, _ = build([(4, 2, 100, 0)])
+    assert _extract.read_lines(mm, table[:0], VD).shape == (0, 0, 0)
+
+
+@pytest.mark.parametrize("batch_bytes", [1, 64, 1 << 20])
+def test_read_lines_batching_is_transparent(batch_bytes):
+    mm, table, expected = build([(4, 2, 100 * k, 0) for k in range(7)])
+    np.testing.assert_array_equal(
+        _extract.read_lines(mm, table, VD, batch_bytes=batch_bytes), np.stack(expected)
+    )
+
+
+def test_gather_paths_agree_for_evenly_and_irregularly_spaced_lines():
+    # Big lines (>= _PER_LINE_MIN_BYTES) so the irregular selection takes the per-line
+    # strided path; a short line between them makes the spacing irregular.
+    entries, expected = [], []
+    raw = b""
+    offsets = []
+    for k in range(3):
+        offsets.append(len(raw))
+        buf, data = make_line(2048, 2, base=k * 10_000)
+        raw += buf
+        expected.append(data)
+        raw += make_line(8, 1, base=0)[0]
+        entries.append(None)
     mm = np.frombuffer(raw, dtype=np.uint8)
-    table, truncated = _read.walk_headers(mm, 0, mm.size, _format.TwixVersion.VD)
-    assert len(table) == 4
-    return mm, table, (d0, d1, d2, d3)
+
+    scan_prefix, chan_hdr = _format.header_sizes(VD)
+    block_len = chan_hdr + 8 * 2048
+    for picked in ([0, 1, 2], [0, 2]):
+        sample0 = np.array(offsets, dtype=np.int64)[picked] + scan_prefix + chan_hdr
+        strided = np.empty((len(picked), 2, 2048), dtype=np.complex64)
+        assert _extract._strided_copy(mm, sample0, 2048, 2, block_len, strided)
+        np.testing.assert_array_equal(strided, np.stack([expected[i] for i in picked]))
 
 
-def test_read_category_gather_average_and_reflect_legacy_layout():
-    mm, table, (d0, d1, d2, d3) = _build_test_table()
-    mask = np.ones(4, dtype=bool)
-    arr = _extract.read_category(
-        mm,
-        table,
-        mask,
-        _format.TwixVersion.VD,
-        remove_os=False,
-        skip_to_first_line=False,
-        legacy_layout=True,
+def test_small_irregular_batch_falls_back_to_index_gather():
+    mm, table, expected = build([(4, 2, 100 * k, 0) for k in range(4)])
+    picked = table[[0, 1, 3]]  # gaps of 1 then 2 lines
+    scan_prefix, chan_hdr = _format.header_sizes(VD)
+    out = np.empty((3, 2, 4), dtype=np.complex64)
+    # Too small for the per-line loop to pay for itself; the index gather handles it.
+    assert not _extract._strided_copy(
+        mm, picked["offset"] + scan_prefix + chan_hdr, 4, 2, chan_hdr + 8 * 4, out
     )
-    assert arr.shape[:3] == (NCOL, NCHA, 3)
-
-    lin0 = arr[:, :, 0, ...].squeeze()
-    lin1 = arr[:, :, 1, ...].squeeze()
-    lin2 = arr[:, :, 2, ...].squeeze()
-
-    np.testing.assert_allclose(lin0, d0.T)
-    np.testing.assert_allclose(lin1, ((d1 + d2) / 2).T)  # duplicate Lin averaged
-    np.testing.assert_allclose(lin2, d3[:, ::-1].T)  # REFLECT flips the readout axis
-
-
-def test_read_category_default_layout_matches_legacy_transposed():
-    mm, table, _ = _build_test_table()
-    mask = np.ones(4, dtype=bool)
-    kwargs = dict(remove_os=False, skip_to_first_line=False)
-
-    legacy = _extract.read_category(
-        mm, table, mask, _format.TwixVersion.VD, legacy_layout=True, **kwargs
+    np.testing.assert_array_equal(
+        _extract.read_lines(mm, picked, VD), np.stack([expected[0], expected[1], expected[3]])
     )
-    default = _extract.read_category(
-        mm, table, mask, _format.TwixVersion.VD, legacy_layout=False, **kwargs
-    )
-
-    assert legacy.shape == (NCOL, NCHA, 3) + (1,) * (len(_extract.DIM_NAMES) - 1)
-    assert default.shape == (3,) + (1,) * (len(_extract.DIM_NAMES) - 1) + (NCHA, NCOL)
-
-    # Only Lin varies (size 3); every other axis is a singleton. Same data, different
-    # (documented) axis order once squeezed down to (Lin, Cha, Col) vs (Col, Cha, Lin).
-    np.testing.assert_array_equal(default.squeeze(), legacy.squeeze().transpose(2, 1, 0))
-
-
-def test_read_category_empty_mask_returns_empty_array():
-    buf0, _ = _make_line(lin=0, base=1)
-    mm = np.frombuffer(buf0, dtype=np.uint8)
-    table, _ = _read.walk_headers(mm, 0, mm.size, _format.TwixVersion.VD)
-
-    arr = _extract.read_category(mm, table, np.zeros(1, dtype=bool), _format.TwixVersion.VD)
-    assert arr.shape[-2:] == (0, 0)
-
-    arr_legacy = _extract.read_category(
-        mm, table, np.zeros(1, dtype=bool), _format.TwixVersion.VD, legacy_layout=True
-    )
-    assert arr_legacy.shape[:2] == (0, 0)
 
 
 def test_remove_oversampling_crops_to_half():
-    arr = np.random.default_rng(0).standard_normal((8, 1, 1)).astype(np.complex64)
-    out = _extract.remove_oversampling(arr, axis=0)
-    assert out.shape[0] == 4
+    rng = np.random.default_rng(0)
+    arr = rng.standard_normal((3, 2, 8)).astype(np.complex64)
+    assert _extract.remove_oversampling(arr).shape == (3, 2, 4)
+    for n in (7, 8, 11, 15, 16):
+        arr = rng.standard_normal((1, 1, n)).astype(np.complex64)
+        assert _extract.remove_oversampling(arr).shape[-1] == _extract.removed_os_len(n)

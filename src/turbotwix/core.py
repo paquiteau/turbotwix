@@ -1,11 +1,27 @@
-"""Public object model: `read_twix`, `TwixScan`, `TwixArray`."""
+"""Public object model: `open_twix` -> `TwixFile` -> `Measurement` -> `LineTable`.
+
+The data model is the file's own: a measurement is a *list of acquisition lines*, each
+with its metadata and its `(ncha, ncol)` block of samples. Selecting lines is a boolean
+query over that table; reading returns `(n_lines, ncha, ncol)`.
+
+Folding lines onto a Cartesian grid is available (`Measurement.to_dense`) but is never
+implicit, because for non-Cartesian acquisitions there is no grid to fold onto — the
+loop counters index shots, interleaves or spokes. Making the dense hypercube the
+default (as pymapvbvd and twixtools do) costs memory proportional to the *nominal*
+matrix rather than to the acquired data, forces a choice about duplicate indices, and
+makes partial reads impossible.
+"""
 
 from __future__ import annotations
+
+import functools
+import warnings
 
 import numpy as np
 
 from turbotwix import _extract, _format, _read, protocol
 from turbotwix._format import (
+    Flag,
     TruncatedFileError,
     TwixParseError,
     TwixVersion,
@@ -13,180 +29,349 @@ from turbotwix._format import (
 )
 
 __all__ = [
-    "TwixArray",
-    "TwixScan",
-    "TwixParseError",
+    "Flag",
+    "LineTable",
+    "Measurement",
     "TruncatedFileError",
+    "TwixFile",
+    "TwixParseError",
     "UnsupportedVersionError",
-    "read_twix",
+    "open_twix",
+    "remove_oversampling",
+    "to_dense",
 ]
 
-# Categories that keep the full nominal Lin/Par matrix size; every other category is
-# shrunk to its acquired range (pymapvbvd's `flagSkipToFirstLine` default).
-_NO_SKIP_CATEGORIES = frozenset({"image", "phasestab"})
+remove_oversampling = _extract.remove_oversampling
+
+#: Names of the 14 loop counters carried by every line header, in header order.
+COUNTERS: tuple[str, ...] = tuple(_format.LINE_COUNTER.names or ())
 
 
-class TwixArray:
-    """Lazy accessor for one scan category's k-space data.
+class LineTable:
+    """The acquisition lines of one measurement, as a queryable table.
 
-    Nothing is read from disk until `.data`/`[...]` is accessed. Unlike pymapvbvd's
-    array object, indexing here always reads the whole category first (vectorized) and
-    then slices in memory — simpler, and the read itself is the fast part; there is no
-    partial/streaming read path in this v1.
+    Indexing returns another `LineTable`, so selections compose:
+    `m.lines.image[m.lines.image.counter("Rep") == 0]`.
     """
 
-    def __init__(
-        self,
-        mm: np.memmap,
-        table: np.ndarray,
-        mask: np.ndarray,
-        version: TwixVersion,
-        name: str,
-        *,
-        remove_os: bool = False,
-        squeeze: bool = False,
-        legacy_layout: bool = False,
-    ) -> None:
+    def __init__(self, rows: np.ndarray, mm: np.ndarray, version: TwixVersion) -> None:
+        self._rows = rows
         self._mm = mm
-        self._table = table
-        self._mask = mask
         self._version = version
-        self.name = name
-        self.remove_os = remove_os
-        self.squeeze = squeeze
-        self.legacy_layout = legacy_layout
-        self._skip_to_first_line = name not in _NO_SKIP_CATEGORIES
-        self.n_acq = int(mask.sum())
 
-    @property
-    def shape(self) -> tuple[int, ...]:
-        shape = _extract.category_shape(
-            self._table, self._mask, self._skip_to_first_line, self.remove_os, self.legacy_layout
-        )
-        return tuple(s for s in shape if s > 1) if self.squeeze else shape
+    # -- structure ---------------------------------------------------------
+    def __len__(self) -> int:
+        return len(self._rows)
 
-    @property
-    def dims(self) -> tuple[str, ...]:
-        names = (
-            ("Col", "Cha", *_extract.DIM_NAMES)
-            if self.legacy_layout
-            else (*_extract.DIM_NAMES, "Cha", "Col")
-        )
-        if not self.squeeze:
-            return names
-        full = _extract.category_shape(
-            self._table, self._mask, self._skip_to_first_line, self.remove_os, self.legacy_layout
-        )
-        return tuple(n for n, s in zip(names, full) if s > 1)
-
-    @property
-    def data(self) -> np.ndarray:
-        arr = _extract.read_category(
-            self._mm,
-            self._table,
-            self._mask,
-            self._version,
-            remove_os=self.remove_os,
-            skip_to_first_line=self._skip_to_first_line,
-            legacy_layout=self.legacy_layout,
-        )
-        return np.squeeze(arr) if self.squeeze else arr
-
-    def __getitem__(self, key) -> np.ndarray:
-        return self.data[key]
-
-    def __array__(self, dtype=None) -> np.ndarray:
-        arr = self.data
-        return arr.astype(dtype, copy=False) if dtype is not None else arr
+    def __getitem__(self, key) -> LineTable:
+        rows = self._rows[key]
+        return LineTable(np.atleast_1d(rows), self._mm, self._version)
 
     def __repr__(self) -> str:
-        return f"TwixArray(name={self.name!r}, shape={self.shape}, n_acq={self.n_acq})"
+        if len(self) == 0:
+            return "LineTable(0 lines)"
+        return f"LineTable({len(self)} lines, shapes={sorted(self.shapes)})"
+
+    @property
+    def rows(self) -> np.ndarray:
+        """The raw `_format.LINE_DTYPE` array (offset, flags, ncol, ncha, counters)."""
+        return self._rows
+
+    # -- per-line fields ---------------------------------------------------
+    @property
+    def offset(self) -> np.ndarray:
+        return self._rows["offset"]
+
+    @property
+    def flags(self) -> np.ndarray:
+        return self._rows["flags"]
+
+    @property
+    def ncol(self) -> np.ndarray:
+        return self._rows["ncol"]
+
+    @property
+    def ncha(self) -> np.ndarray:
+        return self._rows["ncha"]
+
+    @property
+    def counters(self) -> np.ndarray:
+        """Structured (N,) array with one field per loop counter (see `COUNTERS`)."""
+        return self._rows["counters"]
+
+    def counter(self, name: str) -> np.ndarray:
+        return self._rows["counters"][name].astype(np.int64)
+
+    @property
+    def shapes(self) -> set[tuple[int, int]]:
+        """The distinct `(ncha, ncol)` shapes present."""
+        return {(int(a), int(c)) for a, c in zip(self.ncha, self.ncol)}
+
+    def by_shape(self) -> dict[tuple[int, int], LineTable]:
+        """Split into one `LineTable` per `(ncha, ncol)`, so each can be read.
+
+        Flags do not always separate distinct acquisitions: a coil-sensitivity
+        adjustment stores its body-coil (ncha=2) and array-coil (ncha=44) images both
+        as plain ONLINE image lines, told apart only by shape.
+        """
+        return {
+            shape: self[(self.ncha == shape[0]) & (self.ncol == shape[1])]
+            for shape in sorted(self.shapes)
+        }
+
+    def headers(self) -> np.ndarray:
+        """The full VB/VD scan headers of these lines, re-read from the file.
+
+        Everything the compact table leaves out lives here: slice position and
+        orientation, ICE program parameters (where custom non-Cartesian sequences
+        usually stash trajectory or interleaf indices), timestamps, centre indices.
+        """
+        return _read.read_headers(self._mm, self.offset, self._version)
+
+    # -- selection ---------------------------------------------------------
+    def has(self, flag: Flag) -> np.ndarray:
+        """Boolean mask of lines carrying all bits of `flag`."""
+        return _format.has_flag(self.flags, flag)
+
+    def select(self, flag: Flag) -> LineTable:
+        return self[self.has(flag)]
+
+    @property
+    def data(self) -> LineTable:
+        """Everything except the end-of-acquisition marker and PMU/sync blocks."""
+        return self[~self.has(Flag.ACQEND) & ~self.has(Flag.SYNCDATA)]
+
+    @property
+    def image(self) -> LineTable:
+        """Imaging lines: data, minus calibration, feedback and reference-only lines."""
+        rows = self.data
+        excluded = (
+            rows.has(Flag.RTFEEDBACK)
+            | rows.has(Flag.HPFEEDBACK)
+            | rows.has(Flag.PHASCOR)
+            | rows.has(Flag.NOISEADJSCAN)
+            | rows.has(Flag.PHASESTABSCAN)
+            | rows.has(Flag.REFPHASESTABSCAN)
+            | (rows.has(Flag.PATREFSCAN) & ~rows.has(Flag.PATREFANDIMASCAN))
+        )
+        return rows[~excluded]
+
+    @property
+    def noise(self) -> LineTable:
+        """Noise-calibration lines (for pre-whitening)."""
+        return self.data.select(Flag.NOISEADJSCAN)
+
+    @property
+    def refscan(self) -> LineTable:
+        """Parallel-imaging reference lines."""
+        rows = self.data
+        is_ref = rows.has(Flag.PATREFSCAN) | rows.has(Flag.PATREFANDIMASCAN)
+        other = (
+            rows.has(Flag.PHASCOR)
+            | rows.has(Flag.PHASESTABSCAN)
+            | rows.has(Flag.REFPHASESTABSCAN)
+            | rows.has(Flag.RTFEEDBACK)
+            | rows.has(Flag.HPFEEDBACK)
+        )
+        return rows[is_ref & ~other]
+
+    @property
+    def phasecor(self) -> LineTable:
+        """Phase-correction (navigator) lines."""
+        rows = self.data
+        pure_ref = rows.has(Flag.PATREFSCAN) & ~rows.has(Flag.PATREFANDIMASCAN)
+        return rows[rows.has(Flag.PHASCOR) & ~pure_ref]
 
 
-class TwixScan:
-    """One measurement: parsed protocol header plus one `TwixArray` per scan category
-    that was actually present in the file (matching pymapvbvd, empty categories are
-    omitted).
-    """
-
-    def __init__(self, hdr: protocol.AttrDict, arrays: dict[str, TwixArray]) -> None:
-        self.hdr = hdr
-        self._arrays = arrays
-        for name, arr in arrays.items():
-            setattr(self, name, arr)
-
-    def __getitem__(self, name: str):
-        if name == "hdr":
-            return self.hdr
-        return self._arrays[name]
-
-    def category_names(self) -> list[str]:
-        return list(self._arrays)
-
-    def __repr__(self) -> str:
-        return f"TwixScan(categories={self.category_names()!r})"
-
-
-def read_twix(
-    path: str,
-    scans: str = "last",
+def to_dense(
+    samples: np.ndarray,
+    lines: LineTable,
+    dims: tuple[str, ...] = ("Lin", "Par"),
     *,
-    remove_os: bool = False,
-    squeeze: bool = False,
-    legacy_layout: bool = False,
-):
-    """Read a Siemens .dat (TWIX) file.
+    reduce: str = "error",
+    origin: str = "min",
+) -> np.ndarray:
+    """Fold `(n_lines, ncha, ncol)` samples onto a grid indexed by loop counters.
 
-    Parameters
-    ----------
-    path: path to the .dat file.
-    scans: "last" (default, matches pymapvbvd) to return only the final measurement,
-        or "all" to return a list of `TwixScan`, one per scan stored in the file.
-    remove_os: crop out 2x readout oversampling (FFT-based), applied per category.
-    squeeze: drop size-1 dimensions from each category's array/shape.
-    legacy_layout: return arrays in pymapvbvd's (Col, Cha, Lin, Par, ...) axis order
-        instead of the default (Lin, Par, ..., Cha, Col). The default order is the one
-        the fast gather/scatter path produces natively (see `_extract.py`); this flag
-        pays one extra full-array transpose+copy to match pymapvbvd's convention.
+    Returns an array shaped `(*dim_sizes, ncha, ncol)`.
 
-    Returns
-    -------
-    A single `TwixScan`, or a list of them if `scans="all"`.
+    `reduce` decides what happens when several lines land on the same index — which
+    normally means a counter is missing from `dims`, not that the data wants averaging.
+    So the default is to raise and say which; pass "mean", "sum" or "last" to opt in.
+    `origin="min"` shifts each axis so the acquired range starts at 0 (the useful
+    default for reference and navigator scans, which cover part of k-space);
+    `origin="zero"` keeps the raw counter values, i.e. the nominal matrix.
     """
-    mm = _read.open_mmap(path)
-    version = _format.detect_version(mm)
-    raid_entries = _format.parse_raid_directory(mm, version)
+    if len(samples) != len(lines):
+        raise ValueError(f"samples has {len(samples)} lines, table has {len(lines)}")
+    if reduce not in ("error", "mean", "sum", "last"):
+        raise ValueError("reduce must be 'error', 'mean', 'sum' or 'last'")
+    if origin not in ("min", "zero"):
+        raise ValueError("origin must be 'min' or 'zero'")
 
-    if scans == "last":
-        selected = [raid_entries[-1]]
-    elif scans == "all":
-        selected = raid_entries
-    else:
-        raise ValueError("scans must be 'last' or 'all'")
+    idx = [lines.counter(name) for name in dims]
+    if origin == "min":
+        idx = [values - int(values.min()) for values in idx]
+    sizes = [int(values.max()) + 1 for values in idx]
+    flat = np.ravel_multi_index(tuple(idx), sizes)
 
-    results = []
-    for entry in selected:
-        hdr, hdr_len = protocol.parse_protocol(mm, entry.offset)
-        data_start = entry.offset + hdr_len
-        data_end = entry.offset + entry.length
-        table, truncated = _read.walk_headers(mm, data_start, data_end, version)
-        _read.require_complete(table, truncated)
-        categories = _read.classify(table)
+    n_flat = int(np.prod(sizes))
+    dense = np.zeros((n_flat, *samples.shape[1:]), dtype=samples.dtype)
+    counts = np.bincount(flat, minlength=n_flat)
 
-        arrays = {}
-        for name, mask in categories.items():
-            if not mask.any():
-                continue
-            arrays[name] = TwixArray(
-                mm,
-                table,
-                mask,
-                version,
-                name,
-                remove_os=remove_os,
-                squeeze=squeeze,
-                legacy_layout=legacy_layout,
+    if counts.max(initial=0) > 1:
+        if reduce == "error":
+            varying = [
+                name
+                for name in COUNTERS
+                if name not in dims and len(np.unique(lines.counter(name))) > 1
+            ]
+            raise ValueError(
+                f"{int((counts > 1).sum())} grid positions receive more than one line. "
+                + (
+                    f"Counters varying but not in dims: {varying}."
+                    if varying
+                    else "The same counter tuple is acquired repeatedly."
+                )
+                + " Add them to dims, or pass reduce='mean'/'sum'/'last'."
             )
-        results.append(TwixScan(hdr, arrays))
+        if reduce == "last":
+            dense[flat] = samples
+        else:
+            np.add.at(dense, flat, samples)
+            if reduce == "mean":
+                dense /= np.maximum(counts, 1).reshape(-1, *(1,) * (dense.ndim - 1))
+    else:
+        # No collisions: a plain vectorized scatter, far faster than np.add.at.
+        dense[flat] = samples
 
-    return results[0] if len(results) == 1 else results
+    return dense.reshape(*sizes, *samples.shape[1:])
+
+
+class Measurement:
+    """One measurement (raid entry) inside a `.dat` file."""
+
+    def __init__(self, file: TwixFile, entry: _format.RaidEntry, index: int) -> None:
+        self._file = file
+        self._entry = entry
+        self.index = index
+        self.offset = entry.offset
+        self.length = entry.length
+        self.protocol_name = entry.protocol_name
+        self.patient_name = entry.patient_name
+
+    def __repr__(self) -> str:
+        return (
+            f"Measurement(index={self.index}, protocol_name={self.protocol_name!r}, "
+            f"{self.length / 2**20:.1f} MiB)"
+        )
+
+    @functools.cached_property
+    def _header(self) -> tuple[protocol.Protocol, int]:
+        return protocol.parse_protocol(self._file.mm, self.offset)
+
+    @property
+    def hdr(self) -> protocol.Protocol:
+        """Parsed text protocol; each buffer is parsed on first access."""
+        return self._header[0]
+
+    @functools.cached_property
+    def lines(self) -> LineTable:
+        """The acquisition lines, from one pass over the line headers."""
+        data_start = self.offset + self._header[1]
+        rows, truncated = _read.walk_headers(
+            self._file.mm, data_start, self.offset + self.length, self._file.version
+        )
+        if truncated:
+            if not self._file.allow_truncated:
+                _read.require_complete(len(rows), truncated)
+            warnings.warn(
+                f"measurement {self.index} ended before ACQEND after {len(rows)} lines; "
+                "using the acquired lines only",
+                stacklevel=2,
+            )
+        return LineTable(rows, self._file.mm, self._file.version)
+
+    def read(
+        self,
+        lines: LineTable | None = None,
+        *,
+        out: np.ndarray | None = None,
+        reflect: bool = True,
+        batch_bytes: int = _extract._DEFAULT_BATCH_BYTES,
+    ) -> np.ndarray:
+        """Read the samples of `lines` (default: all of them) into `(n, ncha, ncol)`.
+
+        Pass `out=` to read into a preallocated buffer — a `np.memmap`, a slice of a
+        bigger array — which is what makes files larger than RAM readable, since the
+        data is filled in one batch at a time.
+        """
+        table = self.lines if lines is None else lines
+        return _extract.read_lines(
+            self._file.mm,
+            table.rows,
+            self._file.version,
+            out=out,
+            reflect=reflect,
+            batch_bytes=batch_bytes,
+        )
+
+    def to_dense(
+        self,
+        lines: LineTable | None = None,
+        dims: tuple[str, ...] = ("Lin", "Par"),
+        *,
+        reduce: str = "error",
+        origin: str = "min",
+        reflect: bool = True,
+    ) -> np.ndarray:
+        """`read` followed by `to_dense` — convenience for Cartesian acquisitions."""
+        table = self.lines.image if lines is None else lines
+        samples = self.read(table, reflect=reflect)
+        return to_dense(samples, table, dims, reduce=reduce, origin=origin)
+
+
+class TwixFile:
+    """A memory-mapped `.dat` file and the measurements it contains."""
+
+    def __init__(self, path: str, *, allow_truncated: bool = False) -> None:
+        self.path = path
+        self.allow_truncated = allow_truncated
+        self.mm = _read.open_mmap(path)
+        self.version = _format.detect_version(self.mm)
+        entries = _format.parse_raid_directory(self.mm, self.version)
+        # Zero-length entries are aborted measurements with no data written; the
+        # complete ones around them stay readable.
+        self.measurements = [
+            Measurement(self, entry, index)
+            for index, entry in enumerate(entries)
+            if entry.length > 0
+        ]
+        if not self.measurements:
+            raise TwixParseError(f"{path}: no non-empty measurement")
+
+    def __len__(self) -> int:
+        return len(self.measurements)
+
+    def __getitem__(self, index: int) -> Measurement:
+        return self.measurements[index]
+
+    def __iter__(self):
+        return iter(self.measurements)
+
+    def __repr__(self) -> str:
+        names = [m.protocol_name for m in self.measurements]
+        return f"TwixFile({self.path!r}, version={self.version.name}, measurements={names})"
+
+
+def open_twix(path: str, *, allow_truncated: bool = False) -> TwixFile:
+    """Open a Siemens `.dat` (TWIX) file.
+
+    Nothing is read beyond the raid directory: protocols and line tables are parsed per
+    measurement on first access.
+
+    Every measurement in the file is returned, in file order — a scan is commonly
+    preceded by calibration measurements (coil sensitivity, noise), and which one you
+    want is your choice to make, not a default to inherit.
+    """
+    return TwixFile(path, allow_truncated=allow_truncated)

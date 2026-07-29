@@ -16,7 +16,7 @@ _BUFFER_NAME_PATTERN = re.compile(rb"(\w{4,})\x00(.{4})", re.DOTALL)
 _ASCCONV_PATTERN = re.compile(r"### ASCCONV BEGIN[^\n]*\n(.*)\s### ASCCONV END ###", re.DOTALL)
 _ASCCONV_LINE_PATTERN = re.compile(r"(?P<name>\S*)\s*=\s*(?P<value>\S*)\n")
 _ASCCONV_KEY_PATTERN = re.compile(r"(?P<name>\w+)(\[(?P<ix>[0-9]+)\])?")
-_XPROT_SCALAR_PATTERN = re.compile(r'<Param(?:Bool|Long|String)\."(\w+)">\s*{([^}]*)')
+_XPROT_SCALAR_PATTERN = re.compile(r'<Param(Bool|Long|String)\."(\w+)">\s*{([^}]*)')
 _XPROT_DOUBLE_PATTERN = re.compile(
     r'<ParamDouble\."(\w+)">\s*{\s*(<Precision>\s*[0-9]*)?\s*([^}]*)'
 )
@@ -38,27 +38,88 @@ class AttrDict(dict):
     __setattr__ = dict.__setitem__
 
 
-def _try_cast(value: str, key: str):
-    if key.startswith("t"):
-        return value.strip('"')
-    if key.startswith("b"):
-        return bool(value)
-    if key.startswith("l") or key.startswith("ul"):
-        try:
-            return int(value)
-        except ValueError:
-            return value
-    if key.startswith("uc"):
-        try:
-            return int(value, 16) if value.startswith("0x") else int(value)
-        except ValueError:
-            return value
-    if key == "PatientID":
+class Protocol(AttrDict):
+    """Buffer name -> parsed contents, with each buffer parsed on first access.
+
+    A measurement's text header is ~800 KiB across six buffers and regex-parsing all of
+    it costs ~40 ms — which is most of the time spent reading a small file, and pure
+    waste for callers that only want k-space. So each value starts out as the raw bytes
+    and is replaced by its parsed `AttrDict` the first time it is looked up. Every read
+    path (`p["Meas"]`, `p.Meas`, `.get`, `.values`, `.items`, `dict(p)`) parses on the
+    way through, so the laziness is not observable apart from where the time is spent.
+    """
+
+    def __getitem__(self, name: str):
+        value = dict.__getitem__(self, name)
+        if isinstance(value, bytes):  # raw buffer, not parsed yet
+            value = AttrDict(_parse_buffer(value.decode("latin1")))
+            dict.__setitem__(self, name, value)
         return value
-    try:
-        return float(value)
-    except ValueError:
-        return value
+
+    def get(self, name, default=None):
+        return self[name] if name in self else default
+
+    def values(self):
+        return [self[name] for name in self]
+
+    def items(self):
+        return [(name, self[name]) for name in self]
+
+    def __iter__(self):
+        # Defined (rather than inherited) on purpose: `dict(p)` and `{**p}` take a fast
+        # path that reads the underlying table directly, and would hand back raw bytes.
+        # Overriding tp_iter forces the generic path, which goes through __getitem__.
+        return dict.__iter__(self)
+
+
+_INT_PATTERN = re.compile(r"[+-]?\d+$")
+_HEX_PATTERN = re.compile(r"[+-]?0[xX][0-9a-fA-F]+$")
+# Explicit, because Python's own int()/float() accept `_` as a digit separator: the
+# scanner ID "6_0_66327775_20210622_151635_650" parses as 6.07e+26 rather than failing,
+# so a bare `try: float(value)` silently turns identifiers into numbers.
+_FLOAT_PATTERN = re.compile(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$")
+
+
+def _as_number(text: str, integer: bool = False):
+    """`text` as int/float if it is syntactically a number, else None."""
+    if _HEX_PATTERN.match(text):
+        return int(text, 16)
+    if _INT_PATTERN.match(text):
+        return int(text)
+    if _FLOAT_PATTERN.match(text):
+        return int(float(text)) if integer else float(text)
+    return None
+
+
+def _cast_value(value: str):
+    """Type an ascconv value from its own syntax.
+
+    Not from the key's Hungarian prefix, which is what pymapvbvd and twixtools do: that
+    guesses (`b` -> bool, `l` -> long, ...) and is wrong whenever a sequence author
+    named a variable freely, silently returning the raw string for an int field or True
+    for a flag holding "0". Quoting, `0x`, a decimal point and a sign are unambiguous;
+    where the text says nothing, the text is the value.
+    """
+    text = value.strip()
+    if text.startswith('"'):
+        return text.strip('"')
+    number = _as_number(text)
+    return text if number is None else number
+
+
+def _cast_xprot(value: str, kind: str):
+    """Type an XProtocol value from its declared tag (`<ParamLong."x">`), which — unlike
+    ascconv — actually states the type.
+    """
+    text = value.strip().strip('"').strip()
+    if kind == "String":
+        return value.strip().strip('"')
+    if text == "":
+        return None
+    if kind == "Bool":
+        return text.lower() == "true"
+    number = _as_number(text, integer=kind == "Long")
+    return text if number is None else number
 
 
 def _update_ascconv(prot, key: list, value: str) -> None:
@@ -79,11 +140,10 @@ def _update_ascconv(prot, key: list, value: str) -> None:
     if isinstance(last_key, int):
         while len(prot) < last_key + 1:
             prot.append(list())
-        prot[last_key] = value
+        prot[last_key] = _cast_value(value)
         return
 
-    name = last_key[1:] if last_key.startswith("a") else last_key
-    prot[last_key] = _try_cast(value, name)
+    prot[last_key] = _cast_value(value)
 
 
 def _parse_ascconv(buffer: str) -> dict:
@@ -101,41 +161,44 @@ def _parse_ascconv(buffer: str) -> dict:
 
 def _parse_xprot(buffer: str) -> dict:
     xprot: dict = {}
-    tokens = list(_XPROT_SCALAR_PATTERN.finditer(buffer)) + list(
-        _XPROT_DOUBLE_PATTERN.finditer(buffer)
-    )
-    for match in tokens:
-        name = match.group(1)
-        value = re.sub(r'("*)|( *<\w*> *[^\n]*)', "", match.groups()[-1])
-        value = re.sub(r"[\t\n\r\f\v]*", "", value.strip())
-        if name.startswith("a"):
-            xprot[name] = [_try_cast(v, name[1:]) for v in value.split()]
+    tokens = [(m, m.group(1)) for m in _XPROT_SCALAR_PATTERN.finditer(buffer)]
+    tokens += [(m, "Double") for m in _XPROT_DOUBLE_PATTERN.finditer(buffer)]
+    for match, kind in tokens:
+        name = match.group(2) if kind != "Double" else match.group(1)
+        body = re.sub(r" *<\w*> *[^\n]*", "", match.groups()[-1])
+        body = re.sub(r"[\t\n\r\f\v]+", " ", body).strip()
+        if kind == "String" and not name.startswith("a"):
+            xprot[name] = body.strip('"')
+        elif len(body.split()) > 1 or name.startswith("a"):
+            xprot[name] = [_cast_xprot(part, kind) for part in body.split()]
         else:
-            xprot[name] = _try_cast(value, name)
+            xprot[name] = _cast_xprot(body, kind)
     return xprot
 
 
 def _parse_buffer(buffer: str) -> dict:
     ascconv_match = _ASCCONV_PATTERN.search(buffer)
     prot = _parse_ascconv(ascconv_match.group(0)) if ascconv_match else {}
-    remainder = "".join(_ASCCONV_PATTERN.split(buffer))
+    # `.split()` would re-insert the body (the pattern has a capture group); `.sub()`
+    # actually drops the ascconv section, so _parse_xprot only scans XProtocol text.
+    remainder = _ASCCONV_PATTERN.sub("", buffer)
     prot.update(_parse_xprot(remainder))
     return prot
 
 
-def parse_protocol(mm: np.memmap, scan_offset: int) -> tuple[AttrDict, int]:
-    """Parse the text header of the scan starting at `scan_offset`.
+def parse_protocol(mm: np.memmap, scan_offset: int) -> tuple[Protocol, int]:
+    """Split the text header of the scan starting at `scan_offset` into its buffers.
 
     Returns `(protocol, hdr_len)`: `protocol` maps each buffer name (Config, Dicom,
-    Meas, MeasYaps, Phoenix, Spice, ...) to its parsed dict; `hdr_len` is the total
-    byte length of the text header (MDH data for this scan starts at
-    `scan_offset + hdr_len`).
+    Meas, MeasYaps, Phoenix, Spice, ...) to its parsed dict, parsed on first access
+    (see `Protocol`); `hdr_len` is the total byte length of the text header (MDH data
+    for this scan starts at `scan_offset + hdr_len`).
     """
     hdr_len, n_buffer = (
         int(v) for v in np.frombuffer(mm, dtype="<u4", count=2, offset=scan_offset)
     )
     pos = scan_offset + 8
-    protocol = AttrDict()
+    protocol = Protocol()
     for _ in range(n_buffer):
         chunk = bytes(mm[pos : pos + 48])
         match = _BUFFER_NAME_PATTERN.search(chunk)
@@ -143,8 +206,7 @@ def parse_protocol(mm: np.memmap, scan_offset: int) -> tuple[AttrDict, int]:
             break
         name = match.group(1).decode("latin1")
         (buf_len,) = struct.unpack("<I", match.group(2))
-        pos += len(match.group(0))
-        buf = bytes(mm[pos : pos + buf_len]).decode("latin1")
-        protocol[name] = _parse_buffer(buf)
+        pos += match.end()
+        dict.__setitem__(protocol, name, bytes(mm[pos : pos + buf_len]))
         pos += buf_len
     return protocol, hdr_len

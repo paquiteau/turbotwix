@@ -96,7 +96,7 @@ def make_synthetic_dat(
             f.write(line_body)
 
         acqend = np.zeros(1, dtype=_format.VD_SCAN_HEADER)[0]
-        acqend["EvalInfoMask"] = 1 << _format.MASK_BIT["ACQEND"]
+        acqend["EvalInfoMask"] = int(_format.Flag.ACQEND)
         acqend["FlagsAndDMALength"] = acqend_len
         f.write(acqend.tobytes())
 

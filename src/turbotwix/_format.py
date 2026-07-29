@@ -177,10 +177,30 @@ def detect_version(mm: np.memmap) -> TwixVersion:
     for VD/VE the first u32 is 0 (unused) and the second u32 is the scan count
     (<= MAX_RAID_ENTRIES); anything else is treated as VB (first u32 = ASCII header length).
     """
-    first, second = np.frombuffer(mm, dtype="<u4", count=2, offset=0)
+    if mm.size < 8:
+        raise UnsupportedVersionError(f"file is only {mm.size} bytes; not a twix file")
+    first, second = (int(v) for v in np.frombuffer(mm, dtype="<u4", count=2, offset=0))
     if first < 10_000 and second <= MAX_RAID_ENTRIES:
         return TwixVersion.VD
+    # VB: `first` is the text header length. Sanity-check it before committing to the VB
+    # path, so a non-twix file fails here rather than deep inside the header walk.
+    if not 8 <= first <= mm.size:
+        raise UnsupportedVersionError(
+            f"implausible VB header length {first} for a {mm.size}-byte file; "
+            "not a supported VB or VD/VE twix file"
+        )
     return TwixVersion.VB
+
+
+def header_sizes(version: TwixVersion) -> tuple[int, int]:
+    """`(scan_header_prefix, per_channel_header)` byte sizes for one acquisition line.
+
+    VD/VE has a 192-byte per-line scan header followed by a 32-byte header per channel;
+    VB has no per-line prefix and repeats its full 128-byte header per channel.
+    """
+    if version is TwixVersion.VD:
+        return VD_SCAN_HEADER.itemsize, VD_CHANNEL_HEADER.itemsize
+    return 0, VB_HEADER.itemsize
 
 
 class RaidEntry:
@@ -235,10 +255,31 @@ def parse_raid_directory(mm: np.memmap, version: TwixVersion) -> list[RaidEntry]
 
 
 # ---------------------------------------------------------------------------
+# Per-line table produced by the header walk
+# ---------------------------------------------------------------------------
+
+# Only what selecting and gathering actually need. The full 192-byte scan header is
+# available on demand (`LineTable.headers()`), re-read from the file by offset, so the
+# hot table stays 48 bytes per line instead of 204 — on a multi-million-line
+# acquisition that is the difference between tens of MB and a GB, and every boolean
+# selection over it gets proportionally cheaper.
+LINE_DTYPE = np.dtype(
+    [
+        ("offset", "<i8"),  # absolute byte offset of this line's scan header
+        ("flags", "<u8"),  # EvalInfoMask
+        ("ncol", "<u2"),  # SamplesInScan
+        ("ncha", "<u2"),  # UsedChannels
+        ("counters", LINE_COUNTER),
+    ]
+)
+assert LINE_DTYPE.itemsize == 48
+
+
+# ---------------------------------------------------------------------------
 # Eval-info-mask flag bits (64-bit mask, bit position == index in this tuple)
 # ---------------------------------------------------------------------------
 
-MASK_ID: tuple[str, ...] = (
+_MASK_ID: tuple[str, ...] = (
     "ACQEND",
     "RTFEEDBACK",
     "HPFEEDBACK",
@@ -304,7 +345,30 @@ MASK_ID: tuple[str, ...] = (
     "WIP_2",
     "WIP_3",
 )
-MASK_BIT: dict[str, int] = {name: bit for bit, name in enumerate(MASK_ID)}
+MASK_BIT: dict[str, int] = {name: bit for bit, name in enumerate(_MASK_ID)}
+
+# The mask as a real type, so selections read as `lines.has(Flag.PHASCOR)` rather than
+# as bit arithmetic against a string-keyed lookup table. Bits Siemens never documented
+# keep their position under a RESERVED_n name instead of being silently dropped.
+Flag = enum.IntFlag(
+    "Flag",
+    {
+        (name.upper() if not name.startswith("noname") else f"RESERVED_{bit}"): 1 << bit
+        for bit, name in enumerate(_MASK_ID)
+    },
+)
+Flag.__doc__ = "One bit of a line's 64-bit EvalInfoMask."
+
+
+def has_flag(flags: np.ndarray, flag: int) -> np.ndarray:
+    """Vectorized `flags & flag == flag` over a (N,) uint64 array of eval-info masks.
+
+    A combination (`Flag.PHASCOR | Flag.REFLECT`) requires *all* named bits, matching
+    how `&` reads for a single bit.
+    """
+    wanted = np.uint64(int(flag))
+    return (np.asarray(flags) & wanted) == wanted
+
 
 DMA_LEN_MASK = np.uint32(2**25 - 1)
 
@@ -312,9 +376,3 @@ DMA_LEN_MASK = np.uint32(2**25 - 1)
 def dma_len(flags_and_dma_length: np.ndarray) -> np.ndarray:
     """Vectorized extraction of the DMA block length (low 25 bits)."""
     return np.bitwise_and(flags_and_dma_length, DMA_LEN_MASK)
-
-
-def unpack_flags(eval_info_mask: np.ndarray) -> np.ndarray:
-    """Vectorized unpack of a (N,) uint64 eval-info-mask array into a (N, 64) bool array."""
-    bits = np.arange(64, dtype=np.uint64)
-    return ((eval_info_mask[:, None] >> bits[None, :]) & np.uint64(1)).astype(bool)

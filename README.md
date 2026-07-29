@@ -1,138 +1,159 @@
 # turbotwix
 
 A from-scratch, minimal-dependency (numpy only) reader for Siemens MRI raw data
-(`.dat` / TWIX) files, built to read very large files (tens of GB) as fast as the
-underlying storage allows.
+(`.dat` / TWIX) files, built for **non-Cartesian acquisitions** and for files far larger
+than RAM.
 
-Functional scope matches [pymapvbvd](https://github.com/wtclarke/pymapVBVD): VB and
-VD/VE files, the standard scan categories (`image`, `noise`, `refscan`, `refscanPC`,
-`phasecor`, `phasestab` (+ `ref0`/`ref1` variants), `rtfeedback`, `vop`), and the
-`remove_os` / `squeeze` read flags. It does not implement PMU or geometry parsing
-(neither does pymapvbvd) or `regrid` (ramp-sampling regridding) yet.
+Reads VB and VD/VE files. It does not implement PMU decoding, slice-geometry parsing, or
+ramp-sampling regridding.
+
+## The data model
+
+A TWIX measurement is a **list of acquisition lines**, each with metadata and a
+`(ncha, ncol)` block of samples. turbotwix hands you exactly that: a queryable line
+table, and reads that return `(n_lines, ncha, ncol)`.
+
+It does *not* return a dense array indexed by the 14 loop counters, which is what
+pymapvbvd and twixtools do. For a spiral or radial acquisition those counters index
+shots, interleaves or spokes — there is no k-space grid to fold onto — and building one
+anyway costs memory proportional to the *nominal* matrix rather than the acquired data,
+forces a policy on duplicate indices, and makes partial reads impossible. Folding onto a
+grid is available when you want it (`to_dense`), never implicit.
 
 ## Usage
 
 ```python
 import turbotwix as tw
 
-scan = tw.read_twix("meas.dat")
-print(scan.category_names())  # e.g. ['image', 'phasecor', 'rtfeedback']
-print(scan.hdr.MeasYaps["alTR"])  # parsed ascconv/XProtocol header
+f = tw.open_twix("meas.dat")
+f  # TwixFile(..., measurements=['AdjCoilSens', 'bold_spiral...'])
+m = f[-1]  # every measurement is returned; picking one is your call
 
-# default order: (Lin, Par, Sli, Ave, Phs, Eco, Rep, Set, Seg, Ida, Idb, Idc, Idd, Ide, Cha, Col)
-image = scan.image[:]
+lines = m.lines  # one pass over the line headers
+lines.image  # LineTable: imaging lines only
+lines.noise  # noise-calibration lines, for pre-whitening
+len(lines.image), lines.image.shapes  # 4800, {(44, 15000)}
 
-# pymapvbvd-compatible (Col, Cha, Lin, ...) axis order instead (costs one extra
-# full-array transpose+copy -- see "Axis order" below):
-scan = tw.read_twix("meas.dat", legacy_layout=True)
-image = scan.image[
-    :
-]  # (Col, Cha, Lin, Par, Sli, Ave, Phs, Eco, Rep, Set, Seg, Ida, Idb, Idc, Idd, Ide)
+samples = m.read(lines.image)  # (4800, 44, 15000) complex64
 ```
 
-### Axis order
+Selections are boolean queries and compose, so a partial read is just a smaller
+selection — nothing else is touched on disk:
 
-The default array order is `(Lin, Par, Sli, Ave, Phs, Eco, Rep, Set, Seg, Ida, Idb,
-Idc, Idd, Ide, Cha, Col)` — loop counters outermost, `Cha`/`Col` innermost. This is
-**not** pymapvbvd's order. It's deliberately the same *shape* of convention twixtools
-itself uses internally (`_dim_order` in `map_twix.py`, loop-counters first, `Cha`/`Col`
-last): scattering per-line data into the *outermost* axis of a numpy array is
-dramatically faster (measured ~40x for this workload) than scattering into the
-innermost one, and pymapvbvd's `(Col, Cha, ...)` convention forces exactly that slow
-case. Pass `legacy_layout=True` (on `read_twix` or per `TwixArray`) to get pymapvbvd's
-axis order anyway, paying one explicit full-array transpose+copy for it — useful for
-drop-in comparison, not recommended for the hot path on large files.
+```python
+img = m.lines.image
+rep0 = img[img.counter("Rep") == 0]  # one volume's shots
+vol = m.read(rep0)  # (40, 44, 15000), 201 MiB, ~260 ms
+shot = m.read(img[5:6])  # one shot out of 23.6 GiB, ~2 ms
 
-## Why this exists
+lines.has(tw.Flag.REFLECT)  # any of the 64 eval-info bits, by name
+lines.image.headers()  # full scan headers on demand: SliceData,
+# IceProgramPara, timestamps, centre indices
+```
 
-`twixtools` and `pymapvbvd` both bottleneck on a per-line Python loop
-(`seek()`+`read()`/`fromfile()` once per ADC line) when assembling the final k-space
-array; `twixtools` additionally reads every sample byte twice (once discarded while
-building its line list, again on access). turbotwix instead:
+Read into your own buffer to bound memory on files that do not fit in RAM — the data is
+filled one batch at a time:
 
-1. Memory-maps the whole file once (`numpy.memmap`) instead of repeated syscalls.
-2. Walks line headers with a cheap structured-dtype view (no per-line Python objects,
-   no manual bit-twiddling of a raw byte blob).
-3. Classifies every line into its scan category with one vectorized bitwise pass over
-   all headers at once.
-4. Extracts sample data via a **batched vectorized gather** (one `numpy` fancy-index
-   read per memory-bounded batch of lines) instead of a per-line read, and
-   **scatter-writes** into the output array using vectorized advanced indexing instead
-   of a per-line assembly loop.
+```python
+buf = np.empty((len(rep0), 44, 15000), dtype=np.complex64)
+for r in np.unique(img.counter("Rep")):
+    sel = img[img.counter("Rep") == r]
+    m.read(sel, out=buf[: len(sel)])
+    ...
+```
 
-All three example categories on the two bundled sample files reproduce pymapvbvd's
-output **bit-exactly** (with `legacy_layout=True`), including the `remove_os` FFT path;
-the default axis order is separately verified bit-exact against twixtools' own native
-(untransposed) output too (see `tests/test_parity.py`).
+Some measurements hold several acquisitions that the flags do not separate — a coil
+sensitivity adjustment stores body-coil (`ncha=2`) and array-coil (`ncha=44`) images
+both as plain ONLINE image lines. Reading a mixed selection raises rather than
+zero-padding them together; `by_shape()` splits them:
+
+```python
+for (ncha, ncol), sel in m.lines.image.by_shape().items():
+    data = m.read(sel)
+```
+
+### Cartesian data
+
+```python
+lines = m.lines.image
+dense = tw.to_dense(m.read(lines), lines, ("Lin", "Par"))  # (Lin, Par, Cha, Col)
+```
+
+`to_dense` raises if several lines land on the same grid position — that normally means
+a counter is missing from `dims`, not that the data wants averaging — and names the
+counters responsible. Pass `reduce="mean"`, `"sum"` or `"last"` to opt in.
+`remove_oversampling(samples)` is a separate function, not a read flag: it is signal
+processing (an FFT round-trip), and along a non-Cartesian readout it is not meaningful.
+
+## How it goes fast
+
+1. **One mmap**, no per-line `seek()`+`read()` syscalls.
+2. **Run-vectorized header walk.** The stream is self-describing, so it looks
+   inherently sequential — but acquisitions come in runs of identically-shaped lines. The
+   walk hypothesizes a stride from one header and verifies vectorized how far it holds,
+   copying whole runs out of a strided view. Verification is exactly the condition the
+   sequential walk tests, so the result is identical by construction. Windows grow
+   geometrically and are capped by a byte budget: a wrong hypothesis costs O(window),
+   never O(file). On interleaved sequences (a spiral file alternating 5 MiB image lines
+   with 2 KiB PMU blocks, median run length 1) probing cannot pay, so the walk notices
+   and stands down to line-at-a-time, re-arming periodically.
+3. **Strided copies, no index arrays.** A batch of evenly spaced lines is one strided
+   view and a memcpy; an irregularly spaced batch (the norm when line kinds interleave)
+   is one view per line. The index-array gather — an int64 index per complex64 sample,
+   as much index traffic as data — is only the fallback for small irregular batches.
+4. **48-byte line rows.** The walk keeps offset, flags, shape and counters; the full
+   192-byte header is re-read on demand. Selections over the table are ~4x cheaper and
+   a multi-million-line table stays in the tens of MB.
+5. **Lazy protocol.** ~800 KiB of header text across six buffers costs ~40 ms to
+   regex-parse. Splitting it costs 0.04 ms; each buffer is parsed on first access.
+6. **Typed protocol values.** Types come from the value's own syntax (quoting, `0x`, a
+   decimal point) and from XProtocol's declared tags, not from guessing at the key's
+   Hungarian prefix — which returns `"10000"` as a string and `True` for a flag holding
+   `"0"`.
+
+## Correctness
+
+`tests/test_parity.py` checks the extracted samples against pymapvbvd and twixtools:
+line for line and sample for sample against twixtools' `mdb.data`, and `to_dense` against
+pymapvbvd's k-space array (including its `remove_os` path). Install the references with
+`uv sync --group parity`; the tests skip otherwise.
 
 ## Benchmarks
 
-`benchmarks/make_synthetic_dat.py` generates a structurally-valid synthetic `.dat` at
-any size (no proprietary scan data needed); `benchmarks/bench_read.py` times reading
-the full `image` array with turbotwix, pymapvbvd, and twixtools, each in its own
-subprocess for isolated peak-RSS measurement:
+`benchmarks/make_synthetic_dat.py` generates a structurally-valid synthetic `.dat` at any
+size; `benchmarks/bench_read.py` times reading the image data with turbotwix, pymapvbvd
+and twixtools, each in its own subprocess for isolated peak-RSS measurement.
 
 ```
-uv sync --group parity   # installs pymapvbvd + twixtools for comparison only
+uv sync --group parity
 python benchmarks/make_synthetic_dat.py /tmp/test.dat --size 1GB
-python benchmarks/bench_read.py /tmp/test.dat
+python benchmarks/bench_read.py /tmp/test.dat --libs turbotwix turbotwix-lines pymapvbvd twixtools
 ```
 
-Indicative results on this machine (files fully page-cache-resident, so this measures
-algorithmic/CPU overhead rather than raw disk throughput), using the default axis order:
+A 1 GB synthetic file, page-cache-resident (so this measures CPU overhead, not storage):
 
-| file size | turbotwix | pymapvbvd | twixtools |
-|---|---|---|---|
-| 100 MB | **0.13 s** / 238 MB | 0.81 s / 199 MB | 0.59 s / 240 MB |
-| 2 GB | **1.42 s** / 4128 MB | 6.00 s / 1123 MB | 4.10 s / 2255 MB |
+| library | time (s) | peak RSS (MB) |
+|---|---|---|
+| turbotwix (lines) | **0.52** | 2071 |
+| turbotwix (+ `to_dense`) | 0.80 | 3087 |
+| pymapvbvd | 3.13 | 602 |
+| twixtools | 2.21 | 1181 |
 
-turbotwix wins clearly at both sizes. An earlier version of this benchmark (with
-turbotwix defaulting to pymapvbvd's `(Col, Cha, ...)` axis order) showed turbotwix only
-tying pymapvbvd at 2 GB — investigating that gap is *why* the axis order changed: both
-pymapvbvd and that earlier version pay for scattering into the (slow) innermost axis
-implied by `(Col, Cha, ...)`; twixtools avoids it by construction (see "Axis order"
-above), which is what let it win despite doing a completely unvectorized per-line
-Python loop. Switching turbotwix's default to the same *kind* of axis order twixtools
-uses removed that cost entirely rather than trying to make the transpose itself faster.
-(Storing the `(Col, Cha, ...)` array in Fortran/column-major order instead of
-transposing was also tested as a middle ground — it does help, about 2x on the same
-micro-benchmark — but numpy's advanced-indexing assignment still has a real special
-case for indexing an array's *leading* axis specifically, regardless of memory order,
-so it's not competitive with just choosing the leading axis to be the scattered one.)
+Peak RSS is higher than the references mostly because it counts mmap-resident file pages
+(read-only, file-backed, trivially evictable under pressure) on top of the output array.
+The `to_dense` row shows what the dense hypercube costs when you actually want it: 1 GB
+more memory and 50% more time, on data that is *densely* sampled — for undersampled or
+non-Cartesian data the gap widens with the sampling ratio. What this synthetic benchmark
+does not exercise is the case the design is really for: on the real 23.6 GiB spiral file,
+one shot reads in ~2 ms and one repetition (201 MiB) in ~260 ms, where the reference
+readers must assemble the whole 23.6 GiB array first.
 
-**Peak memory** is still higher than the references (~4.1 GB vs 1.1–2.3 GB at 2 GB),
-for three additive reasons: (1) the output accumulator itself, ~2 GB — unavoidable,
-it's the size of the returned array; (2) per-batch gather/index buffers, controlled by
-a `batch_bytes` budget; (3) mmap-resident file pages picked up while gathering, roughly
-the size of the file. (2) turned out to be a real, free win: profiling showed the
-initial 512 MB default batch budget bought *no* extra speed over a ~1–2 MB budget once
-the axis-order fix landed (both plateau at the same time), so shrinking the default
-batch budget to 2 MB cut peak RSS by about 1 GB *and* got faster (less allocator
-churn) — that's what produced the 4.1 GB/1.42 s numbers above, down from an earlier
-5.1 GB/2.48 s at the old 512 MB default. (3) is harder to fix directly and is partly a
-measurement artifact of this machine having abundant free RAM: mmap'd, read-only,
-file-backed pages are trivially evictable and the kernel will reclaim them under real
-memory pressure without our involvement, so on a genuinely memory-constrained machine
-reading a real 50 GB file, resident memory should stay closer to accumulator size +
-working set rather than growing with file size the way it appears to here. Proactively
-hinting eviction (`madvise(MADV_DONTNEED)` on already-consumed byte ranges) could pull
-that number down further but wasn't implemented — it's the next thing worth trying if
-real-file memory pressure turns out to matter in practice.
+## Known limitations
 
-The real-world win this architecture is ultimately aimed at — avoiding thousands of
-small `seek()+read()` syscalls on genuinely disk-bound 50 GB files rather than
-page-cache-hot ones — is also not directly exercised by this in-memory benchmark and
-should be validated on real large files.
-
-## Known limitations (v1)
-
-- No `regrid` (ramp-sampling) support yet.
-- No PMU or slice-geometry parsing (out of scope, matching pymapvbvd).
-- Assumes homogeneous (NCol, NCha) within a category for the fast path; heterogeneous
-  shapes (e.g. partial Fourier mixed with full lines) fall back to per-shape bucketing,
-  which is less tested.
-- Indexing (`array[...]`) always reads the whole category first, then slices in
-  memory — there is no partial/streaming read path.
+- No ramp-sampling regridding, PMU decoding or slice-geometry parsing.
+- Reading a selection that mixes `(ncha, ncol)` shapes raises; use `by_shape()`.
+- The line table is rebuilt on every `open_twix`; there is no on-disk index cache
+  (walking a 23.6 GiB measurement takes ~55 ms, so it has not been worth one).
 
 ## Development
 

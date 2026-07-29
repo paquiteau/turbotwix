@@ -1,6 +1,10 @@
+import struct
+
 import numpy as np
+import pytest
 
 from turbotwix import _format, _read
+from turbotwix._format import Flag
 
 
 def test_dtype_sizes():
@@ -8,12 +12,27 @@ def test_dtype_sizes():
     assert _format.VD_SCAN_HEADER.itemsize == 192
     assert _format.VD_CHANNEL_HEADER.itemsize == 32
     assert _format.LINE_COUNTER.itemsize == 28
-    assert _format.SLICE_DATA.itemsize == 28
+    assert _format.LINE_DTYPE.itemsize == 48
     assert _format.MR_PARC_RAID_FILE_ENTRY.itemsize == 152
     assert _format.MULTI_RAID_FILE_HEADER.itemsize == 8 + 64 * 152
-    assert len(_format.MASK_ID) == 64
-    assert _format.MASK_BIT["ACQEND"] == 0
-    assert _format.MASK_BIT["SYNCDATA"] == 5
+
+
+def test_flags_cover_all_64_bits():
+    assert Flag.ACQEND == 1
+    assert Flag.SYNCDATA == 1 << 5
+    assert Flag.REFLECT == 1 << 24
+    assert max(int(f) for f in Flag) == 1 << 63
+
+
+def test_has_flag_requires_every_named_bit():
+    flags = np.array([0, int(Flag.PHASCOR), int(Flag.PHASCOR | Flag.REFLECT)], dtype=np.uint64)
+    assert _format.has_flag(flags, Flag.PHASCOR).tolist() == [False, True, True]
+    assert _format.has_flag(flags, Flag.PHASCOR | Flag.REFLECT).tolist() == [False, False, True]
+
+
+def test_header_sizes_match_dtypes():
+    assert _format.header_sizes(_format.TwixVersion.VD) == (192, 32)
+    assert _format.header_sizes(_format.TwixVersion.VB) == (0, 128)
 
 
 def test_detect_version_and_raid_directory(gre_path, epi_path):
@@ -26,79 +45,103 @@ def test_detect_version_and_raid_directory(gre_path, epi_path):
         assert entries[0].length > 0
 
 
-def test_walk_headers_and_classify_gre(gre_path):
-    mm = _read.open_mmap(gre_path)
-    version = _format.detect_version(mm)
-    entry = _format.parse_raid_directory(mm, version)[-1]
-    from turbotwix import protocol
+def test_detect_version_rejects_non_twix_files():
+    with pytest.raises(_format.UnsupportedVersionError):
+        _format.detect_version(np.zeros(4, dtype=np.uint8))
 
-    _, hdr_len = protocol.parse_protocol(mm, entry.offset)
-    table, truncated = _read.walk_headers(
-        mm, entry.offset + hdr_len, entry.offset + entry.length, version
-    )
-    assert not truncated
-    assert len(table) == 161  # 160 image lines + 1 ACQEND
-    categories = _read.classify(table)
-    assert int(categories["image"].sum()) == 160
+    # Not VD (second u32 > MAX_RAID_ENTRIES) and an implausible VB header length.
+    garbage = np.frombuffer(struct.pack("<II", 0xDEADBEEF, 0xFFFF) + bytes(64), dtype=np.uint8)
+    with pytest.raises(_format.UnsupportedVersionError):
+        _format.detect_version(garbage)
 
 
-def test_walk_headers_and_classify_epi(epi_path):
-    mm = _read.open_mmap(epi_path)
-    version = _format.detect_version(mm)
-    entry = _format.parse_raid_directory(mm, version)[-1]
-    from turbotwix import protocol
-
-    _, hdr_len = protocol.parse_protocol(mm, entry.offset)
-    table, truncated = _read.walk_headers(
-        mm, entry.offset + hdr_len, entry.offset + entry.length, version
-    )
-    assert not truncated
-    categories = _read.classify(table)
-    assert int(categories["image"].sum()) == 80
-    assert int(categories["phasecor"].sum()) == 3
-    assert int(categories["rtfeedback"].sum()) == 3
+# --- header walk ----------------------------------------------------------
 
 
-def _pack_header(dma_len: int, eval_mask: int, ncol: int = 0, ncha: int = 0) -> bytes:
+def line(ncol: int, ncha: int, eval_mask: int = 0, lin: int = 0, dma_len: int = 0) -> bytes:
+    """One complete VD line: scan header + per-channel (header + samples)."""
     h = np.zeros(1, dtype=_format.VD_SCAN_HEADER)[0]
-    h["FlagsAndDMALength"] = dma_len
-    h["EvalInfoMask"] = eval_mask
     h["SamplesInScan"] = ncol
     h["UsedChannels"] = ncha
-    return h.tobytes()
+    h["EvalInfoMask"] = eval_mask
+    h["FlagsAndDMALength"] = dma_len
+    h["Counter"]["Lin"] = lin
+    return h.tobytes() + bytes(ncha * (32 + 8 * ncol))
 
 
-def test_walk_headers_handles_syncdata_and_acqend():
-    # One image line (ncol=4, ncha=1): 192 (scan header) + 1*(32+8*4) = 256 bytes.
-    image_line = _pack_header(dma_len=0, eval_mask=0, ncol=4, ncha=1)
-    image_line += bytes(32 + 8 * 4)  # one channel header + 4 complex64 samples
-
-    # A SYNCDATA block: header trusts the raw dma length field directly (bit 5 set).
-    sync_len = 192 + 16
-    sync_line = _pack_header(dma_len=sync_len, eval_mask=1 << 5)
-    sync_line += bytes(16)
-
-    # ACQEND: bit 0 set, raw dma length == header size only.
-    acqend_line = _pack_header(dma_len=192, eval_mask=1)
-
-    buf = np.frombuffer(image_line + sync_line + acqend_line, dtype=np.uint8)
-
-    table, truncated = _read.walk_headers(buf, 0, buf.size, _format.TwixVersion.VD)
-    assert not truncated
-    assert len(table) == 3
-    assert table["file_offset"].tolist() == [0, 256, 256 + sync_len]
-    assert table["dma_len"].tolist() == [256, sync_len, 192]
-
-    categories = _read.classify(table)
-    assert categories["image"].tolist() == [True, False, False]
+def acqend() -> bytes:
+    return line(0, 0, eval_mask=int(Flag.ACQEND), dma_len=192)
 
 
-def test_walk_headers_reports_truncation():
-    # A single image-shaped header claiming more channels/samples than are actually
-    # present in the buffer -> the walk must stop and report truncation, not read OOB.
-    image_line = _pack_header(dma_len=0, eval_mask=0, ncol=4, ncha=1)
-    buf = np.frombuffer(image_line, dtype=np.uint8)  # missing the channel+data payload
+def _sequential_walk(mm: np.ndarray, start: int, end: int) -> tuple[list, bool]:
+    """Reference: the line-at-a-time walk that `walk_headers` vectorizes into runs."""
+    pos, out = start, []
+    while pos + 192 <= end:
+        h = mm[pos : pos + 192].view(_format.VD_SCAN_HEADER)[0]
+        ev = int(h["EvalInfoMask"])
+        if ev & 1 or ev & (1 << 5):
+            length = int(h["FlagsAndDMALength"]) & (2**25 - 1)
+        else:
+            length = 192 + int(h["UsedChannels"]) * (32 + 8 * int(h["SamplesInScan"]))
+        out.append((pos, length))
+        if ev & 1:
+            return out, False
+        if length <= 0 or pos + length > end:
+            return out, True
+        pos += length
+    return out, True
 
-    table, truncated = _read.walk_headers(buf, 0, buf.size, _format.TwixVersion.VD)
+
+def assert_matches_sequential(raw: bytes) -> np.ndarray:
+    mm = np.frombuffer(raw, dtype=np.uint8)
+    table, truncated = _read.walk_headers(mm, 0, mm.size, _format.TwixVersion.VD)
+    expected, exp_truncated = _sequential_walk(mm, 0, mm.size)
+    assert truncated == exp_truncated
+    assert table["offset"].tolist() == [off for off, _ in expected]
+    return table
+
+
+def test_walk_run_detection_matches_sequential():
+    # Long runs either side of a single odd line, then a differently-shaped tail.
+    raw = b"".join(line(4, 2, lin=i) for i in range(50))
+    raw += line(6, 1, lin=99)
+    raw += b"".join(line(4, 2, lin=i) for i in range(30))
+    sync_len = 192 + 64
+    raw += line(0, 0, eval_mask=int(Flag.SYNCDATA), dma_len=sync_len) + bytes(sync_len - 192)
+    raw += b"".join(line(8, 3, lin=i) for i in range(20))
+    raw += acqend()
+
+    table = assert_matches_sequential(raw)
+    assert len(table) == 50 + 1 + 30 + 1 + 20 + 1
+    assert table["counters"]["Lin"][:50].tolist() == list(range(50))
+    assert table["ncol"][:50].tolist() == [4] * 50
+
+
+def test_walk_interleaved_shapes_match_sequential():
+    # Median run length 1 (as in real spiral/feedback-interleaved sequences): exercises
+    # the adaptive give-up path, which must not change the result.
+    raw = b"".join(line(4, 2, lin=i) + line(1, 1, lin=i) for i in range(40))
+    raw += acqend()
+
+    table = assert_matches_sequential(raw)
+    assert len(table) == 81
+
+
+def test_walk_reports_truncation():
+    # A header claiming more channels/samples than the buffer holds: the walk must stop
+    # and report truncation, not read out of bounds.
+    mm = np.frombuffer(line(4, 1)[:192], dtype=np.uint8)
+    table, truncated = _read.walk_headers(mm, 0, mm.size, _format.TwixVersion.VD)
     assert truncated
     assert len(table) == 1
+
+
+def test_read_headers_recovers_full_scan_headers():
+    raw = b"".join(line(4, 2, lin=i) for i in range(5)) + acqend()
+    mm = np.frombuffer(raw, dtype=np.uint8)
+    table, _ = _read.walk_headers(mm, 0, mm.size, _format.TwixVersion.VD)
+
+    headers = _read.read_headers(mm, table["offset"], _format.TwixVersion.VD)
+    assert headers.dtype == _format.VD_SCAN_HEADER
+    assert headers["Counter"]["Lin"][:5].tolist() == list(range(5))
+    assert headers["SamplesInScan"][:5].tolist() == [4] * 5
