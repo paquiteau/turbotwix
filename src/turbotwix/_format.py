@@ -165,8 +165,6 @@ MULTI_RAID_FILE_HEADER = np.dtype(
 )
 assert MULTI_RAID_FILE_HEADER.itemsize == 8 + MAX_RAID_ENTRIES * 152
 
-SINGLE_MEAS_INIT = np.dtype([("hdr_len", "<u4"), ("unknown", "<u4")])  # 8 bytes
-
 
 class TwixVersion(enum.Enum):
     VB = "vb"
