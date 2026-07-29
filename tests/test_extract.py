@@ -100,6 +100,7 @@ def test_remove_oversampling_crops_to_half():
     rng = np.random.default_rng(0)
     arr = rng.standard_normal((3, 2, 8)).astype(np.complex64)
     assert _extract.remove_oversampling(arr).shape == (3, 2, 4)
-    for n in (7, 8, 11, 15, 16):
+    # n//4 kept from the front, n - 3n//4 from the back, so odd lengths do not round up.
+    for n, kept in ((7, 3), (8, 4), (11, 5), (15, 7), (16, 8)):
         arr = rng.standard_normal((1, 1, n)).astype(np.complex64)
-        assert _extract.remove_oversampling(arr).shape[-1] == _extract.removed_os_len(n)
+        assert _extract.remove_oversampling(arr).shape[-1] == kept

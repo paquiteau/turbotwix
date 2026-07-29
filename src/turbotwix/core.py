@@ -46,6 +46,20 @@ remove_oversampling = _extract.remove_oversampling
 #: Names of the 14 loop counters carried by every line header, in header order.
 COUNTERS: tuple[str, ...] = tuple(_format.LINE_COUNTER.names or ())
 
+# Anything carrying one of these is calibration, feedback or navigator data rather than
+# imaging data. One combined mask instead of one boolean array per flag.
+_NOT_IMAGING = (
+    Flag.RTFEEDBACK
+    | Flag.HPFEEDBACK
+    | Flag.PHASCOR
+    | Flag.NOISEADJSCAN
+    | Flag.PHASESTABSCAN
+    | Flag.REFPHASESTABSCAN
+)
+_NOT_PLAIN_REFERENCE = (
+    Flag.PHASCOR | Flag.PHASESTABSCAN | Flag.REFPHASESTABSCAN | Flag.RTFEEDBACK | Flag.HPFEEDBACK
+)
+
 
 class LineTable:
     """The acquisition lines of one measurement, as a queryable table.
@@ -130,31 +144,27 @@ class LineTable:
 
     # -- selection ---------------------------------------------------------
     def has(self, flag: Flag) -> np.ndarray:
-        """Boolean mask of lines carrying all bits of `flag`."""
+        """Boolean mask of lines carrying *all* bits of `flag`."""
         return _format.has_flag(self.flags, flag)
 
+    def has_any(self, flag: Flag) -> np.ndarray:
+        """Boolean mask of lines carrying *any* bit of `flag`."""
+        return _format.has_any_flag(self.flags, flag)
+
     def select(self, flag: Flag) -> LineTable:
+        """The lines carrying all bits of `flag`."""
         return self[self.has(flag)]
 
     @property
     def data(self) -> LineTable:
         """Everything except the end-of-acquisition marker and PMU/sync blocks."""
-        return self[~self.has(Flag.ACQEND) & ~self.has(Flag.SYNCDATA)]
+        return self[~self.has_any(Flag.ACQEND | Flag.SYNCDATA)]
 
     @property
     def image(self) -> LineTable:
         """Imaging lines: data, minus calibration, feedback and reference-only lines."""
         rows = self.data
-        excluded = (
-            rows.has(Flag.RTFEEDBACK)
-            | rows.has(Flag.HPFEEDBACK)
-            | rows.has(Flag.PHASCOR)
-            | rows.has(Flag.NOISEADJSCAN)
-            | rows.has(Flag.PHASESTABSCAN)
-            | rows.has(Flag.REFPHASESTABSCAN)
-            | (rows.has(Flag.PATREFSCAN) & ~rows.has(Flag.PATREFANDIMASCAN))
-        )
-        return rows[~excluded]
+        return rows[~rows.has_any(_NOT_IMAGING) & ~rows._reference_only]
 
     @property
     def noise(self) -> LineTable:
@@ -165,22 +175,19 @@ class LineTable:
     def refscan(self) -> LineTable:
         """Parallel-imaging reference lines."""
         rows = self.data
-        is_ref = rows.has(Flag.PATREFSCAN) | rows.has(Flag.PATREFANDIMASCAN)
-        other = (
-            rows.has(Flag.PHASCOR)
-            | rows.has(Flag.PHASESTABSCAN)
-            | rows.has(Flag.REFPHASESTABSCAN)
-            | rows.has(Flag.RTFEEDBACK)
-            | rows.has(Flag.HPFEEDBACK)
-        )
-        return rows[is_ref & ~other]
+        is_ref = rows.has_any(Flag.PATREFSCAN | Flag.PATREFANDIMASCAN)
+        return rows[is_ref & ~rows.has_any(_NOT_PLAIN_REFERENCE)]
 
     @property
     def phasecor(self) -> LineTable:
         """Phase-correction (navigator) lines."""
         rows = self.data
-        pure_ref = rows.has(Flag.PATREFSCAN) & ~rows.has(Flag.PATREFANDIMASCAN)
-        return rows[rows.has(Flag.PHASCOR) & ~pure_ref]
+        return rows[rows.has(Flag.PHASCOR) & ~rows._reference_only]
+
+    @property
+    def _reference_only(self) -> np.ndarray:
+        """PATREFSCAN without PATREFANDIMASCAN: reference data that is not also image."""
+        return self.has(Flag.PATREFSCAN) & ~self.has(Flag.PATREFANDIMASCAN)
 
 
 def to_dense(
@@ -253,12 +260,8 @@ class Measurement:
 
     def __init__(self, file: TwixFile, entry: _format.RaidEntry, index: int) -> None:
         self._file = file
-        self._entry = entry
         self.index = index
-        self.offset = entry.offset
-        self.length = entry.length
-        self.protocol_name = entry.protocol_name
-        self.patient_name = entry.patient_name
+        self.meas_id, self.offset, self.length, self.patient_name, self.protocol_name = entry
 
     def __repr__(self) -> str:
         return (
@@ -283,13 +286,10 @@ class Measurement:
             self._file.mm, data_start, self.offset + self.length, self._file.version
         )
         if truncated:
+            message = f"measurement {self.index} ended before ACQEND after {len(rows)} lines"
             if not self._file.allow_truncated:
-                _read.require_complete(len(rows), truncated)
-            warnings.warn(
-                f"measurement {self.index} ended before ACQEND after {len(rows)} lines; "
-                "using the acquired lines only",
-                stacklevel=2,
-            )
+                raise TruncatedFileError(f"{message}; pass allow_truncated=True to read anyway")
+            warnings.warn(f"{message}; using the acquired lines only", stacklevel=2)
         return LineTable(rows, self._file.mm, self._file.version)
 
     def read(

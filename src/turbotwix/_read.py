@@ -1,5 +1,5 @@
-"""Header walk (run-vectorized, see `walk_headers`) and fully vectorized category
-classification.
+"""Memory-mapping the file and walking its line headers (run-vectorized, see
+`walk_headers`).
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import numpy as np
 from numpy.lib.stride_tricks import as_strided
 
 from turbotwix import _format
-from turbotwix._format import TruncatedFileError, TwixVersion
+from turbotwix._format import TwixVersion
 
 _INITIAL_CAPACITY = 4096
 
@@ -143,8 +143,8 @@ def walk_headers(
     hdr_size = header_dtype.itemsize
     scan_hdr_prefix, channel_hdr_size = _format.header_sizes(version)
 
-    acqend_bit = np.uint64(1) << np.uint64(_format.MASK_BIT["ACQEND"])
-    sync_bit = np.uint64(1) << np.uint64(_format.MASK_BIT["SYNCDATA"])
+    acqend_bit = np.uint64(int(_format.Flag.ACQEND))
+    sync_bit = np.uint64(int(_format.Flag.SYNCDATA))
 
     capacity = _INITIAL_CAPACITY
     table = np.empty(capacity, dtype=_format.LINE_DTYPE)
@@ -228,10 +228,3 @@ def walk_headers(
         pos += run * length
 
     return table[:n], truncated
-
-
-def require_complete(n_lines: int, truncated: bool) -> None:
-    if truncated:
-        raise TruncatedFileError(
-            f"scan ended before ACQEND after {n_lines} lines; file may be incomplete"
-        )

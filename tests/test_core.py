@@ -34,6 +34,33 @@ def test_line_selection(gre_path, epi_path):
     assert len(first_rep) <= len(m.lines.image)
 
 
+def test_selection_presets():
+    F = tw.Flag
+    kinds = [
+        ("image", 0),
+        ("image", int(F.PATREFANDIMASCAN)),  # reference *and* image: counts as both
+        ("noise", int(F.NOISEADJSCAN)),
+        ("refscan", int(F.PATREFSCAN)),
+        ("phasecor", int(F.PHASCOR)),
+        ("refscanPC", int(F.PATREFSCAN | F.PHASCOR)),  # reference-only, so not phasecor
+        ("feedback", int(F.RTFEEDBACK)),
+        ("sync", int(F.SYNCDATA)),
+        ("acqend", int(F.ACQEND)),
+    ]
+    mm, table, _ = build([(4, 2, 0, mask) for _, mask in kinds])
+    lines = tw.LineTable(table, mm, _format.TwixVersion.VD)
+
+    def picked(sel):
+        return sorted(int(np.flatnonzero(table["offset"] == o)[0]) for o in sel.offset)
+
+    assert picked(lines.data) == [0, 1, 2, 3, 4, 5, 6]  # everything but sync and acqend
+    assert picked(lines.image) == [0, 1]  # plain image, and reference-and-image
+    assert picked(lines.noise) == [2]
+    assert picked(lines.refscan) == [1, 3]  # reference-and-image counts here too
+    assert picked(lines.phasecor) == [4]  # not 5: that one is reference-only
+    assert picked(lines.select(F.RTFEEDBACK)) == [6]
+
+
 def test_flags_and_counters(gre_path):
     m = tw.open_twix(gre_path)[-1]
     lines = m.lines

@@ -10,6 +10,7 @@ than per-object construction or manual bit-slicing of a raw byte blob.
 from __future__ import annotations
 
 import enum
+from typing import NamedTuple
 
 import numpy as np
 
@@ -203,52 +204,40 @@ def header_sizes(version: TwixVersion) -> tuple[int, int]:
     return 0, VB_HEADER.itemsize
 
 
-class RaidEntry:
-    __slots__ = ("meas_id", "file_id", "offset", "length", "patient_name", "protocol_name")
+class RaidEntry(NamedTuple):
+    """One measurement's entry in the multi-raid directory."""
 
-    def __init__(
-        self,
-        meas_id: int,
-        file_id: int,
-        offset: int,
-        length: int,
-        patient_name: str,
-        protocol_name: str,
-    ) -> None:
-        self.meas_id = meas_id
-        self.file_id = file_id
-        self.offset = offset
-        self.length = length
-        self.patient_name = patient_name
-        self.protocol_name = protocol_name
+    meas_id: int  # the MID that names the file on the scanner
+    offset: int
+    length: int
+    patient_name: str
+    protocol_name: str
 
 
 def parse_raid_directory(mm: np.memmap, version: TwixVersion) -> list[RaidEntry]:
     """Return the list of scans stored in the file, in file order."""
     if version is TwixVersion.VB:
-        return [RaidEntry(0, 0, 0, mm.size, "", "")]
+        return [RaidEntry(0, 0, mm.size, "", "")]
 
     header = np.frombuffer(mm, dtype=MULTI_RAID_FILE_HEADER, count=1, offset=0)[0]
     count = int(header["hdr"]["count"])
     if count <= 0 or count > MAX_RAID_ENTRIES:
         raise TwixParseError(f"invalid raid directory scan count: {count}")
 
+    def name(field: str) -> str:
+        return bytes(raw[field]).split(b"\x00", 1)[0].decode("latin1")
+
     entries = []
     for k in range(count):
         raw = header["entry"][k]
         length = int(raw["len"])
-        if length == 0:
-            if count == 1:
-                length = mm.size - int(raw["off"])
-            # else: leave as 0; caller may skip zero-length entries
+        # A single zero-length entry means "to end of file"; several mean the trailing
+        # ones were never written, and the caller skips those.
+        if length == 0 and count == 1:
+            length = mm.size - int(raw["off"])
         entries.append(
             RaidEntry(
-                meas_id=int(raw["measId"]),
-                file_id=int(raw["fileId"]),
-                offset=int(raw["off"]),
-                length=length,
-                patient_name=bytes(raw["patName"]).split(b"\x00", 1)[0].decode("latin1"),
-                protocol_name=bytes(raw["protName"]).split(b"\x00", 1)[0].decode("latin1"),
+                int(raw["measId"]), int(raw["off"]), length, name("patName"), name("protName")
             )
         )
     return entries
@@ -345,8 +334,6 @@ _MASK_ID: tuple[str, ...] = (
     "WIP_2",
     "WIP_3",
 )
-MASK_BIT: dict[str, int] = {name: bit for bit, name in enumerate(_MASK_ID)}
-
 # The mask as a real type, so selections read as `lines.has(Flag.PHASCOR)` rather than
 # as bit arithmetic against a string-keyed lookup table. Bits Siemens never documented
 # keep their position under a RESERVED_n name instead of being silently dropped.
@@ -361,13 +348,14 @@ Flag.__doc__ = "One bit of a line's 64-bit EvalInfoMask."
 
 
 def has_flag(flags: np.ndarray, flag: int) -> np.ndarray:
-    """Vectorized `flags & flag == flag` over a (N,) uint64 array of eval-info masks.
-
-    A combination (`Flag.PHASCOR | Flag.REFLECT`) requires *all* named bits, matching
-    how `&` reads for a single bit.
-    """
+    """Vectorized "carries *all* bits of `flag`" over a (N,) uint64 array of masks."""
     wanted = np.uint64(int(flag))
     return (np.asarray(flags) & wanted) == wanted
+
+
+def has_any_flag(flags: np.ndarray, flag: int) -> np.ndarray:
+    """Vectorized "carries *any* bit of `flag`" — one test for a whole set of bits."""
+    return (np.asarray(flags) & np.uint64(int(flag))) != 0
 
 
 DMA_LEN_MASK = np.uint32(2**25 - 1)

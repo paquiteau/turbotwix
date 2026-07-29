@@ -113,25 +113,6 @@ def _gather_batch(
     out[:] = raw[:, :, chan_hdr:].view("<c8")
 
 
-def line_shape(table: np.ndarray) -> tuple[int, int]:
-    """The `(ncha, ncol)` shared by every line in `table`.
-
-    Raises if the selection mixes shapes: silently padding them into one array (what
-    pymapvbvd does) hides partial-Fourier and mixed-category selections behind
-    plausible-looking zeros.
-    """
-    if len(table) == 0:
-        return 0, 0
-    ncol = np.unique(table["ncol"])
-    ncha = np.unique(table["ncha"])
-    if ncol.size > 1 or ncha.size > 1:
-        raise ValueError(
-            f"selection mixes line shapes: ncol={ncol.tolist()}, ncha={ncha.tolist()}. "
-            "Select one shape at a time (e.g. lines[lines.ncol == 512])."
-        )
-    return int(ncha[0]), int(ncol[0])
-
-
 def read_lines(
     mm: np.ndarray,
     table: np.ndarray,
@@ -145,9 +126,19 @@ def read_lines(
 
     `reflect` un-reverses lines flagged REFLECT (bipolar readouts store them backwards);
     pass False to get the samples exactly as laid down on disk.
+
+    A selection mixing `(ncha, ncol)` shapes raises: silently padding them into one array
+    (what pymapvbvd does) hides partial-Fourier and mixed-acquisition selections behind
+    plausible-looking zeros.
     """
-    ncha, ncol = line_shape(table)
     n = len(table)
+    ncol_all, ncha_all = np.unique(table["ncol"]), np.unique(table["ncha"])
+    if ncol_all.size > 1 or ncha_all.size > 1:
+        raise ValueError(
+            f"selection mixes line shapes: ncol={ncol_all.tolist()}, ncha={ncha_all.tolist()}. "
+            "Split it first, e.g. with LineTable.by_shape()."
+        )
+    ncha, ncol = (int(ncha_all[0]), int(ncol_all[0])) if n else (0, 0)
     shape = (n, ncha, ncol)
     if out is None:
         out = np.empty(shape, dtype=np.complex64)
@@ -168,11 +159,6 @@ def read_lines(
             if flip.any():
                 chunk[flip] = chunk[flip][:, :, ::-1]
     return out
-
-
-def removed_os_len(n: int) -> int:
-    """Readout length left by `remove_oversampling` for an input length of `n`."""
-    return n // 4 + (n - 3 * n // 4)
 
 
 def remove_oversampling(samples: np.ndarray, axis: int = -1) -> np.ndarray:
