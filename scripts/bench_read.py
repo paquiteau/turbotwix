@@ -26,13 +26,11 @@ _READ_CODE = {
     # turbotwix returns lines, the references return a dense counter-indexed array, so
     # the comparable operation is read + fold onto the grid.
     "turbotwix": (
+        "import logging\n"
+        "logging.getLogger('turbotwix').setLevel(logging.DEBUG)\n"
         "import turbotwix as tw\n"
         "m = tw.open_twix(path)[-1]\n"
-        "lines = m.lines.image\n"
-        "tw.to_dense(m.read(lines), lines, ('Lin', 'Rep'))\n"
-    ),
-    "turbotwix-lines": (
-        "import turbotwix as tw\nm = tw.open_twix(path)[-1]\nm.read(m.lines.image)\n"
+        "m.to_dense(m.lines.image, ('Lin', 'Rep'))\n"
     ),
     "pymapvbvd": (
         "import mapvbvd\n"
@@ -97,7 +95,11 @@ def run_single(lib: str, path: str) -> dict:
         [sys.executable, "-c", script], capture_output=True, text=True, check=False
     )
     if result.returncode != 0:
-        return {"error": result.stderr.strip().splitlines()[-1] if result.stderr else "failed"}
+        return {
+            "error": (
+                result.stderr.strip().splitlines()[-1] if result.stderr else "failed"
+            )
+        }
     line = result.stdout.strip().splitlines()[-1]
     return json.loads(line)
 
@@ -105,7 +107,9 @@ def run_single(lib: str, path: str) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path", help=".dat file to read")
-    parser.add_argument("--libs", nargs="+", default=["turbotwix", "pymapvbvd", "twixtools"])
+    parser.add_argument(
+        "--libs", nargs="+", default=["turbotwix", "pymapvbvd", "twixtools"]
+    )
     args = parser.parse_args()
 
     rows = []
