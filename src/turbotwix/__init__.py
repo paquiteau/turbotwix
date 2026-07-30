@@ -28,7 +28,7 @@ import mmap as _mmap
 import re
 import struct
 import warnings
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import numpy as np
 from numpy.lib.stride_tricks import as_strided
@@ -46,7 +46,7 @@ __all__ = [
     "UnsupportedLayoutError",
     "UnsupportedVersionError",
     "open_twix",
-    "remove_oversampling",
+    "minimal_dims",
     "to_dense",
 ]
 
@@ -62,11 +62,11 @@ class TruncatedFileError(TwixParseError):
 class UnsupportedLayoutError(TwixParseError):
     """Raised when a measurement is not laid out the way turbotwix requires.
 
-    Two things are required rather than guessed: all ADC lines of a measurement share one
-    `(ncha, ncol)`, and their offsets are 8-byte aligned (which is what lets extraction
-    view the file as one `complex64` array and copy by strides). A coil-sensitivity
-    adjustment storing body-coil and array-coil images together breaks the first; use
-    pymapvbvd or twixtools for those.
+    Two things are required rather than guessed: all ADC lines of a measurement share
+    one `(ncha, ncol)`, and their offsets are 8-byte aligned (which is what lets
+    extraction view the file as one `complex64` array and copy by strides). A
+    coil-sensitivity adjustment storing body-coil and array-coil images together breaks
+    the first; use pymapvbvd or twixtools for those.
     """
 
 
@@ -85,24 +85,23 @@ _USE_A_REFERENCE_READER = (
 # ---------------------------------------------------------------------------
 
 #: The 14 loop counters every header carries, in header order.
-LINE_COUNTER = np.dtype(
-    [
-        ("Lin", "<u2"),
-        ("Ave", "<u2"),
-        ("Sli", "<u2"),
-        ("Par", "<u2"),
-        ("Eco", "<u2"),
-        ("Phs", "<u2"),
-        ("Rep", "<u2"),
-        ("Set", "<u2"),
-        ("Seg", "<u2"),
-        ("Ida", "<u2"),
-        ("Idb", "<u2"),
-        ("Idc", "<u2"),
-        ("Idd", "<u2"),
-        ("Ide", "<u2"),
-    ]
-)  # 28 bytes
+COUNTERS = [
+    "Lin",
+    "Ave",
+    "Sli",
+    "Par",
+    "Eco",
+    "Phs",
+    "Rep",
+    "Set",
+    "Seg",
+    "Ida",
+    "Idb",
+    "Idc",
+    "Idd",
+    "Ide",
+]
+LINE_COUNTER = np.dtype([(c, "<u2") for c in COUNTERS])  # 28 bytes
 
 _CUTOFF = np.dtype([("Pre", "<u2"), ("Post", "<u2")])
 _SLICE_POS = np.dtype([("Sag", "<f4"), ("Cor", "<f4"), ("Tra", "<f4")])
@@ -134,7 +133,7 @@ VB_HEADER = np.dtype(
         ("PTABPosNeg", "<u2"),
     ]
 )
-assert VB_HEADER.itemsize == 128
+# assert VB_HEADER.itemsize == 128
 
 #: VD/VE: a 192-byte scan header once per line, then a 32-byte header per channel.
 VD_SCAN_HEADER = np.dtype(
@@ -169,7 +168,7 @@ VD_SCAN_HEADER = np.dtype(
         ("CRC", "<u4"),
     ]
 )
-assert VD_SCAN_HEADER.itemsize == 192
+# assert VD_SCAN_HEADER.itemsize == 192
 
 VD_CHANNEL_HEADER = np.dtype(
     [
@@ -177,14 +176,17 @@ VD_CHANNEL_HEADER = np.dtype(
         ("MeasUID", "<i4"),
         ("ScanCounter", "<u4"),
         ("Reserved1", "<i4"),
-        ("SequenceTime", "<u4"),  # packed bitfield, opaque here: not needed to find samples
+        (
+            "SequenceTime",
+            "<u4",
+        ),  # packed bitfield, opaque here: not needed to find samples
         ("Unused2", "<u4"),
         ("ChannelId", "<u2"),
         ("Unused3", "<u2"),
         ("CRC", "<u4"),
     ]
 )
-assert VD_CHANNEL_HEADER.itemsize == 32
+# assert VD_CHANNEL_HEADER.itemsize == 32
 
 MAX_RAID_ENTRIES = 64
 
@@ -203,12 +205,12 @@ _RAID_ENTRY = np.dtype(
 RAID_DIRECTORY = np.dtype(
     [("hdSize", "<u4"), ("count", "<u4"), ("entry", _RAID_ENTRY, (MAX_RAID_ENTRIES,))]
 )
-assert RAID_DIRECTORY.itemsize == 8 + MAX_RAID_ENTRIES * 152
+# assert RAID_DIRECTORY.itemsize == 8 + MAX_RAID_ENTRIES * 152
 
 # One row per ADC line: only what selection and extraction need. The full 192-byte scan
-# header is re-read on demand (`LineTable.headers()`), so the hot table stays 48 bytes per
-# line instead of 204 — on a multi-million-line acquisition that is tens of MB rather than
-# a GB, and every boolean selection over it gets proportionally cheaper.
+# header is re-read on demand (`LineTable.headers()`), so the hot table stays 48 bytes
+# per line instead of 204 — on a multi-million-line acquisition that is tens of MB
+# rather than a GB, and every boolean selection over it gets proportionally cheaper.
 LINE_DTYPE = np.dtype(
     [
         ("offset", "<i8"),  # absolute byte offset of this line's scan header
@@ -218,50 +220,59 @@ LINE_DTYPE = np.dtype(
         ("counters", LINE_COUNTER),
     ]
 )
-assert LINE_DTYPE.itemsize == 48
+# assert LINE_DTYPE.itemsize == 48
 
 #: Names of the 14 loop counters, in header order.
-COUNTERS: tuple[str, ...] = tuple(LINE_COUNTER.names or ())
 
 
-class TwixVersion(enum.Enum):
+class TwixVersion(enum.StrEnum):
     VB = "vb"  # VA / VB baselines: one measurement per file, no directory
     VD = "vd"  # VD11 ... VE11, early XA: a multi-raid container
 
 
+HEADER_SIZES = {
+    TwixVersion.VB: (0, VB_HEADER.itemsize),
+    TwixVersion.VD: (VD_SCAN_HEADER.itemsize, VD_CHANNEL_HEADER.itemsize),
+}
+SCAN_HEADER_DTYPES = {TwixVersion.VB: VB_HEADER, TwixVersion.VD: VD_SCAN_HEADER}
+
+
 def detect_version(mm: np.ndarray) -> TwixVersion:
-    """Sniff VB vs VD/VE from the first 8 bytes, as pymapvbvd does.
+    """Sniff VB vs VD/VE from the first 8 bytes.
 
     For VD/VE the first `uint32` is small (unused) and the second is the measurement
     count; for VB the first is the byte length of the ASCII header, so it is large.
+
+    Uses the same heuristic as pymapvbvd.
+
+    Parameters
+    ----------
+    mm : numpy.ndarray
+        The whole file as a ``uint8`` array (typically a `numpy.memmap`).
+
+    Returns
+    -------
+    TwixVersion
+        `TwixVersion.VB` or `TwixVersion.VD`.
+
+    Raises
+    ------
+    UnsupportedVersionError
+        If the file is shorter than 8 bytes, or if neither layout is plausible.
     """
     if mm.size < 8:
         raise UnsupportedVersionError(f"file is only {mm.size} bytes; not a twix file")
     first, second = (int(v) for v in np.frombuffer(mm, dtype="<u4", count=2))
     if first < 10_000 and second <= MAX_RAID_ENTRIES:
         return TwixVersion.VD
-    # VB: `first` is the text header length. Range-check it here, so a non-twix file fails
-    # immediately rather than deep inside the header walk.
+    # VB: `first` is the text header length. Range-check it here, so a non-twix file
+    # fails immediately rather than deep inside the header walk.
     if not 8 <= first <= mm.size:
         raise UnsupportedVersionError(
             f"implausible VB header length {first} for a {mm.size}-byte file; "
             "not a supported VB or VD/VE twix file"
         )
     return TwixVersion.VB
-
-
-def header_sizes(version: TwixVersion) -> tuple[int, int]:
-    """`(per-line prefix, per-channel header)` byte sizes, so that a line's length is
-    `prefix + ncha * (channel_header + 8 * ncol)` for both generations.
-    """
-    if version is TwixVersion.VD:
-        return VD_SCAN_HEADER.itemsize, VD_CHANNEL_HEADER.itemsize
-    return 0, VB_HEADER.itemsize
-
-
-def scan_header_dtype(version: TwixVersion) -> np.dtype:
-    """The per-line header dtype: the VD scan header, or VB's channel-0 header."""
-    return VD_SCAN_HEADER if version is TwixVersion.VD else VB_HEADER
 
 
 class RaidEntry(NamedTuple):
@@ -279,6 +290,23 @@ def parse_raid_directory(mm: np.ndarray, version: TwixVersion) -> list[RaidEntry
 
     A VB file is a single measurement, modelled as a one-entry directory covering the
     whole file so the rest of the code has one path.
+
+    Parameters
+    ----------
+    mm : numpy.ndarray
+        The whole file as a ``uint8`` array.
+    version : TwixVersion
+        The layout detected by `detect_version`.
+
+    Returns
+    -------
+    list of RaidEntry
+        One entry per announced measurement, in file order.
+
+    Raises
+    ------
+    TwixParseError
+        If the VD/VE directory announces an implausible measurement count.
     """
     if version is TwixVersion.VB:
         return [RaidEntry(0, 0, mm.size, "", "")]
@@ -291,8 +319,9 @@ def parse_raid_directory(mm: np.ndarray, version: TwixVersion) -> list[RaidEntry
     entries = []
     for raw in directory["entry"][:count]:
         length = int(raw["len"])
-        # A single zero-length entry means "to end of file"; several mean the trailing ones
-        # were announced but never written (an aborted scan), and are dropped by TwixFile.
+        # A single zero-length entry means "to end of file"; several mean the trailing
+        # ones were announced but never written (an aborted scan), and are dropped by
+        # TwixFile.
         if length == 0 and count == 1:
             length = mm.size - int(raw["off"])
         entries.append(
@@ -308,6 +337,18 @@ def parse_raid_directory(mm: np.ndarray, version: TwixVersion) -> list[RaidEntry
 
 
 def _cstr(raw) -> str:
+    """Decode a fixed-width, NUL-padded byte field as text.
+
+    Parameters
+    ----------
+    raw : bytes-like
+        The raw field, e.g. one ``S64`` entry of the raid directory.
+
+    Returns
+    -------
+    str
+        Everything before the first NUL, decoded as latin-1.
+    """
     return bytes(raw).split(b"\x00", 1)[0].decode("latin1")
 
 
@@ -315,8 +356,8 @@ def _cstr(raw) -> str:
 # 2. The eval-info mask
 # ---------------------------------------------------------------------------
 
-# Bit position == index in this tuple. Positions Siemens never documented keep their slot
-# under a RESERVED_n name rather than being silently dropped.
+# Bit position == index in this tuple. Positions Siemens never documented keep their
+# slot under a RESERVED_n name rather than being silently dropped.
 _MASK_ID: tuple[str, ...] = (
     "ACQEND",
     "RTFEEDBACK",
@@ -397,13 +438,39 @@ _DMA_LEN_MASK = 2**25 - 1
 
 
 def has_flag(flags: np.ndarray, flag: int) -> np.ndarray:
-    """Vectorized "carries *all* bits of `flag`" over an array of masks."""
+    """Vectorized "carries *all* bits of `flag`" over an array of masks.
+
+    Parameters
+    ----------
+    flags : numpy.ndarray
+        ``uint64`` EvalInfoMask values, one per line.
+    flag : int
+        The bit or combination of bits to test for, typically a `Flag`.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean array, True where every bit of `flag` is set.
+    """
     wanted = np.uint64(int(flag))
     return (np.asarray(flags) & wanted) == wanted
 
 
 def has_any_flag(flags: np.ndarray, flag: int) -> np.ndarray:
-    """Vectorized "carries *any* bit of `flag`" — one test for a whole set of bits."""
+    """Vectorized "carries *any* bit of `flag`" — one test for a whole set of bits.
+
+    Parameters
+    ----------
+    flags : numpy.ndarray
+        ``uint64`` EvalInfoMask values, one per line.
+    flag : int
+        The bits to test for, typically a union of `Flag` members.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean array, True where at least one bit of `flag` is set.
+    """
     return (np.asarray(flags) & np.uint64(int(flag))) != 0
 
 
@@ -416,7 +483,9 @@ _ASCCONV = re.compile(r"### ASCCONV BEGIN[^\n]*\n(.*)\s### ASCCONV END ###", re.
 _ASCCONV_LINE = re.compile(r"(?P<name>\S*)\s*=\s*(?P<value>\S*)\n")
 _ASCCONV_KEY = re.compile(r"(?P<name>\w+)(\[(?P<ix>[0-9]+)\])?")
 _XPROT_SCALAR = re.compile(r'<Param(Bool|Long|String)\."(\w+)">\s*{([^}]*)')
-_XPROT_DOUBLE = re.compile(r'<ParamDouble\."(\w+)">\s*{\s*(<Precision>\s*[0-9]*)?\s*([^}]*)')
+_XPROT_DOUBLE = re.compile(
+    r'<ParamDouble\."(\w+)">\s*{\s*(<Precision>\s*[0-9]*)?\s*([^}]*)'
+)
 
 _INT = re.compile(r"[+-]?\d+$")
 _HEX = re.compile(r"[+-]?0[xX][0-9a-fA-F]+$")
@@ -445,12 +514,12 @@ class AttrDict(dict):
 class Protocol(AttrDict):
     """Buffer name -> parsed contents, with each buffer parsed on first access.
 
-    A measurement's text header is ~800 KiB across six buffers and regex-parsing all of it
-    costs ~40 ms — most of the time spent reading a small file, and pure waste for callers
-    that only want k-space. So each value starts out as raw bytes and is replaced by its
-    parsed `AttrDict` the first time it is looked up. Every read path (`p["Meas"]`,
-    `p.Meas`, `.get`, `.values`, `.items`, `dict(p)`) parses on the way through, so the
-    laziness is not observable apart from where the time is spent.
+    A measurement's text header is ~800 KiB across six buffers and regex-parsing all of
+    it costs ~40 ms — most of the time spent reading a small file, and pure waste for
+    callers that only want k-space. So each value starts out as raw bytes and is
+    replaced by its parsed `AttrDict` the first time it is looked up. Every read path
+    (`p["Meas"]`, `p.Meas`, `.get`, `.values`, `.items`, `dict(p)`) parses on the way
+    through, so the laziness is not observable apart from where the time is spent.
     """
 
     def __getitem__(self, name: str):
@@ -479,11 +548,26 @@ class Protocol(AttrDict):
 def parse_protocol(mm: np.ndarray, offset: int) -> tuple[Protocol, int]:
     """Split the text header of the measurement at `offset` into its named buffers.
 
-    Returns `(protocol, hdr_len)`; the MDH stream starts at `offset + hdr_len`. Each
-    buffer is located by its `name\\0` + `uint32` length pair, searched for within the next
-    48 bytes because real files carry a little padding there.
+    Each buffer is located by its `name\\0` + `uint32` length pair, searched for within
+    the next 48 bytes because real files carry a little padding there.
+
+    Parameters
+    ----------
+    mm : numpy.ndarray
+        The whole file as a ``uint8`` array.
+    offset : int
+        Byte offset of the measurement, from its `RaidEntry`.
+
+    Returns
+    -------
+    protocol : Protocol
+        Buffer name -> raw bytes, parsed on first access.
+    hdr_len : int
+        Byte length of the text header; the MDH stream starts at ``offset + hdr_len``.
     """
-    hdr_len, n_buffer = (int(v) for v in np.frombuffer(mm, dtype="<u4", count=2, offset=offset))
+    hdr_len, n_buffer = (
+        int(v) for v in np.frombuffer(mm, dtype="<u4", count=2, offset=offset)
+    )
     protocol = Protocol()
     pos = offset + 8
     for _ in range(n_buffer):
@@ -492,13 +576,29 @@ def parse_protocol(mm: np.ndarray, offset: int) -> tuple[Protocol, int]:
             break
         (buf_len,) = struct.unpack("<I", match.group(2))
         pos += match.end()
-        dict.__setitem__(protocol, match.group(1).decode("latin1"), bytes(mm[pos : pos + buf_len]))
+        dict.__setitem__(
+            protocol, match.group(1).decode("latin1"), bytes(mm[pos : pos + buf_len])
+        )
         pos += buf_len
     return protocol, hdr_len
 
 
 def _as_number(text: str, integer: bool = False):
-    """`text` as an int/float if it is syntactically a number, else None."""
+    """`text` as an int/float if it is syntactically a number, else None.
+
+    Parameters
+    ----------
+    text : str
+        The token to type, already stripped.
+    integer : bool, default False
+        Whether a value written as a float should be truncated to an int, which is what
+        a `ParamLong` declaration asks for.
+
+    Returns
+    -------
+    int or float or None
+        The parsed number, or None if `text` is not numeric syntax.
+    """
     if _HEX.match(text):
         return int(text, 16)
     if _INT.match(text):
@@ -512,10 +612,20 @@ def _cast_value(value: str):
     """Type an ascconv value from its own syntax.
 
     Not from the key's Hungarian prefix, which is what the reference readers do: that
-    guesses (`b` -> bool, `l` -> long, ...) and misfires whenever a sequence author named a
-    variable freely, returning `"10000"` as a string for an int field or True for a flag
-    holding `"0"`. Quoting, `0x`, a decimal point and a sign are unambiguous; where the
-    text says nothing, the text is the value.
+    guesses (`b` -> bool, `l` -> long, ...) and misfires whenever a sequence author
+    named a variable freely, returning `"10000"` as a string for an int field or True
+    for a flag holding `"0"`. Quoting, `0x`, a decimal point and a sign are unambiguous;
+    where the text says nothing, the text is the value.
+
+    Parameters
+    ----------
+    value : str
+        The right-hand side of one ascconv `key = value` line.
+
+    Returns
+    -------
+    str or int or float
+        The typed value; the unquoted text itself when the syntax says nothing.
     """
     text = value.strip()
     if text.startswith('"'):
@@ -525,8 +635,22 @@ def _cast_value(value: str):
 
 
 def _cast_xprot(value: str, kind: str):
-    """Type an XProtocol value from its declared tag (`<ParamLong."x">`), which — unlike
-    ascconv — actually states the type.
+    """Type an XProtocol value from its declared tag.
+
+    Unlike ascconv, a `<ParamLong."x">` tag actually states the type, so nothing has to
+    be inferred from the syntax.
+
+    Parameters
+    ----------
+    value : str
+        The token as it appears in the buffer.
+    kind : {'Bool', 'Long', 'String', 'Double'}
+        The type named by the enclosing tag.
+
+    Returns
+    -------
+    str or bool or int or float or None
+        The typed value; None for an empty non-string body.
     """
     text = value.strip().strip('"').strip()
     if kind == "String":
@@ -540,7 +664,22 @@ def _cast_xprot(value: str, kind: str):
 
 
 def _update_ascconv(prot, key: list, value: str) -> None:
-    """Insert `value` at the dotted/indexed `key` path, growing lists as needed."""
+    """Insert `value` at the dotted/indexed `key` path, growing lists as needed.
+
+    Parameters
+    ----------
+    prot : dict or list
+        The container to insert into, modified in place.
+    key : list
+        The path, as alternating names and integer indices (``sSlice[2].dThickness``
+        becomes ``["sSlice", 2, "dThickness"]``).
+    value : str
+        The raw text to type and store at that path.
+
+    Returns
+    -------
+    None
+    """
     if "__attribute__" in key:
         return
     head = key[0]
@@ -559,7 +698,18 @@ def _update_ascconv(prot, key: list, value: str) -> None:
 
 
 def _parse_ascconv(buffer: str) -> dict:
-    """The flat `key = value` MrProt dump, rebuilt into nested dicts/lists."""
+    """The flat `key = value` MrProt dump, rebuilt into nested dicts/lists.
+
+    Parameters
+    ----------
+    buffer : str
+        The ascconv section, delimiters included.
+
+    Returns
+    -------
+    dict
+        The MrProt tree, with indexed keys as lists.
+    """
     mrprot: dict = {}
     for line in _ASCCONV_LINE.finditer(buffer):
         key: list = []
@@ -577,6 +727,16 @@ def _parse_xprot(buffer: str) -> dict:
 
     Multi-token bodies and names starting with `a` (the array convention) become lists;
     the nesting itself is not modelled.
+
+    Parameters
+    ----------
+    buffer : str
+        The buffer text, with the ascconv section already removed.
+
+    Returns
+    -------
+    dict
+        Parameter name -> typed value.
     """
     xprot: dict = {}
     tokens = [(m, m.group(1)) for m in _XPROT_SCALAR.finditer(buffer)]
@@ -595,11 +755,22 @@ def _parse_xprot(buffer: str) -> dict:
 
 
 def _parse_buffer(buffer: str) -> dict:
-    """One header buffer, which mixes an ascconv section with XProtocol text."""
+    """One header buffer, which mixes an ascconv section with XProtocol text.
+
+    Parameters
+    ----------
+    buffer : str
+        The decoded buffer contents.
+
+    Returns
+    -------
+    dict
+        The ascconv tree, updated with the flattened XProtocol scalars.
+    """
     match = _ASCCONV.search(buffer)
     prot = _parse_ascconv(match.group(0)) if match else {}
-    # `.sub()` rather than `.split()`: the pattern has a capture group, so splitting would
-    # re-insert the ascconv body into the text scanned as XProtocol.
+    # `.sub()` rather than `.split()`: the pattern has a capture group, so splitting
+    # would re-insert the ascconv body into the text scanned as XProtocol.
     prot.update(_parse_xprot(_ASCCONV.sub("", buffer)))
     return prot
 
@@ -610,7 +781,18 @@ def _parse_buffer(buffer: str) -> dict:
 
 
 def open_mmap(path: str) -> np.memmap:
-    """Memory-map the whole file read-only, with a best-effort sequential-access hint."""
+    """Memory-map the whole file read-only, with a best-effort sequential-access hint.
+
+    Parameters
+    ----------
+    path : str
+        Path to the `.dat` file.
+
+    Returns
+    -------
+    numpy.memmap
+        The file as a read-only ``uint8`` array.
+    """
     mm = np.memmap(path, dtype=np.uint8, mode="r")
     raw = getattr(mm, "_mmap", None)
     if raw is not None:
@@ -626,36 +808,60 @@ def build_table(
 ) -> tuple[np.ndarray, bool]:
     """Build the line table of one measurement.
 
-    Returns `(table, truncated)`, `table` being a `LINE_DTYPE` array with one row per ADC
-    line and `truncated` saying whether the measurement ran out of bytes before its ACQEND
-    block. Blocks that hold no samples (ACQEND, SYNCDATA/PMU) are stepped over, not
-    recorded: nothing here can decode them, and leaving them out is what keeps every table
+    Blocks that hold no samples (ACQEND, SYNCDATA/PMU) are stepped over, not recorded:
+    nothing here can decode them, and leaving them out is what keeps every table
     single-shaped.
 
-    The stream carries no index and no line count — each line's length is computed from its
-    own header — so this looks inherently sequential. Two regimes, each with its own path:
+    The stream carries no index and no line count — each line's length is computed from
+    its own header — so this looks inherently sequential. Two regimes, each with its own
+    path:
 
-    * a **single uniform run** of identically shaped lines ending in ACQEND, which is what
-      Cartesian scans produce, often with millions of small lines. There the stride from
-      the first header holds throughout, so `_uniform_run` needs no per-line work at all:
-      the count is a division, the offsets an `arange`, the flags and counters one strided
-      read of all N headers.
+    * a **single uniform run** of identically shaped lines ending in ACQEND, which is
+      what Cartesian scans produce, often with millions of small lines. There the
+      stride from the first header holds throughout, so `_uniform_run` needs no
+      per-line work at all: the count is a division, the offsets an `arange`, the flags
+      and counters one strided read of all N headers.
     * **anything else** — interleaved SYNCDATA/PMU blocks, several runs — which is what
-      non-Cartesian sequences produce. There the block count is small precisely because the
-      lines are big (a 25 GiB spiral measurement is ~7.6k blocks of ~5 MiB), so `_walk`
-      steps block by block and costs tens of milliseconds on such a file.
+      non-Cartesian sequences produce. There the block count is small precisely because
+      the lines are big (a 25 GiB spiral measurement is ~7.6k blocks of ~5 MiB), so
+      `_walk` steps block by block and costs tens of milliseconds on such a file.
 
     The fast path is tried first and declines when its hypothesis fails; the walk is the
     general answer, not a penalty box.
+
+    Parameters
+    ----------
+    mm : numpy.ndarray
+        The whole file as a ``uint8`` array.
+    data_start : int
+        Byte offset of the first block, past the text header. Must be 8-byte aligned.
+    scan_end : int
+        Byte offset one past the end of this measurement.
+    version : TwixVersion
+        The layout detected by `detect_version`.
+
+    Returns
+    -------
+    table : numpy.ndarray
+        A `LINE_DTYPE` array with one row per ADC line.
+    truncated : bool
+        Whether the measurement ran out of bytes before its ACQEND block.
+
+    Raises
+    ------
+    UnsupportedLayoutError
+        If `data_start` or any line offset is not 8-byte aligned, or if the lines do not
+        all share one ``(ncha, ncol)``.
     """
     if data_start % 8:
         # Every sample offset is `line_offset + prefix + (c+1)*chan_hdr + c*8*ncol`, and
-        # every term but the line offset is a multiple of 8. Keeping line offsets aligned is
-        # what lets extraction view the whole file as a complex64 array.
+        # every term but the line offset is a multiple of 8. Keeping line offsets
+        # aligned is what lets extraction view the whole file as a complex64 array.
         raise UnsupportedLayoutError(
-            f"measurement data starts at unaligned offset {data_start}. {_USE_A_REFERENCE_READER}"
+            f"measurement data starts at unaligned offset {data_start}. "
+            f"{_USE_A_REFERENCE_READER}"
         )
-    header_dtype = scan_header_dtype(version)
+    header_dtype = SCAN_HEADER_DTYPES[version]
     if data_start + header_dtype.itemsize > scan_end:
         return np.empty(0, dtype=LINE_DTYPE), True
 
@@ -666,17 +872,40 @@ def build_table(
 
 
 def _uniform_run(
-    mm: np.ndarray, data_start: int, scan_end: int, version: TwixVersion, header_dtype: np.dtype
+    mm: np.ndarray,
+    data_start: int,
+    scan_end: int,
+    version: TwixVersion,
+    header_dtype: np.dtype,
 ) -> tuple[np.ndarray, bool] | None:
-    """The whole table by arithmetic, or None if this measurement is not one uniform run.
+    """The whole table by arithmetic, or None if this is not one uniform run.
 
     The hypothesis — the stride computed from the first header holds to the end — is
     verified exactly over every line before being used, and testing it costs one strided
     read of the headers the walk would have read anyway.
+
+    Parameters
+    ----------
+    mm : numpy.ndarray
+        The whole file as a ``uint8`` array.
+    data_start : int
+        Byte offset of the first block.
+    scan_end : int
+        Byte offset one past the end of this measurement.
+    version : TwixVersion
+        The layout detected by `detect_version`.
+    header_dtype : numpy.dtype
+        The scan-header dtype for `version`.
+
+    Returns
+    -------
+    tuple of (numpy.ndarray, bool) or None
+        The `(table, truncated)` pair as for `build_table`, or None if the measurement
+        is not a single uniform run and the caller must fall back to `_walk`.
     """
     hdr_size = header_dtype.itemsize
-    prefix, chan_hdr = header_sizes(version)
-    stop_bits = np.uint64(int(Flag.ACQEND | Flag.SYNCDATA))
+    prefix, chan_hdr = HEADER_SIZES[version]
+    stop_bits = np.uint64(Flag.ACQEND | Flag.SYNCDATA)
 
     first = mm[data_start : data_start + hdr_size].view(header_dtype)[0]
     ncol, ncha = int(first["SamplesInScan"]), int(first["UsedChannels"])
@@ -691,26 +920,30 @@ def _uniform_run(
     # A zero-copy strided view of the N candidate headers. `as_strided` does no bounds
     # checking; the division above is what keeps every one of them inside the region.
     headers = as_strided(
-        mm[data_start : data_start + hdr_size].view(header_dtype), shape=(n,), strides=(stride,)
+        mm[data_start : data_start + hdr_size].view(header_dtype),
+        shape=(n,),
+        strides=(stride,),
     )
-    if np.any(headers["SamplesInScan"] != ncol) or np.any(headers["UsedChannels"] != ncha):
+    if np.any(headers["SamplesInScan"] != ncol) or np.any(
+        headers["UsedChannels"] != ncha
+    ):
         return None  # a shape change mid-measurement
     if np.any(headers["EvalInfoMask"] & stop_bits):
         return None  # interleaved sideband blocks, or a second run
     # The one check the walk never needs: a walk is correct because it never guesses a
-    # stride, while this path guesses once, so it needs independent evidence that what it
-    # read at that stride really were headers. ScanCounter increments once per block, so a
-    # constant positive step across the run provides it.
+    # stride, while this path guesses once, so it needs independent evidence that what
+    # it read at that stride really were headers. ScanCounter increments once per block,
+    # so a constant positive step across the run provides it.
     counter = headers["ScanCounter"].astype(np.int64)
     if n > 1:
         step = int(counter[1] - counter[0])
         if step <= 0 or not np.all(np.diff(counter) == step):
             return None
 
-    # ACQEND is shorter than a line, so it falls outside the division above; what is left
-    # over must be exactly it, or a further run of another shape is hiding there. Less than
-    # a header left means the file was cut short — still a uniform run, just an
-    # unterminated one.
+    # ACQEND is shorter than a line, so it falls outside the division above; what is
+    # left over must be exactly it, or a further run of another shape is hiding there.
+    # Less than a header left means the file was cut short — still a uniform run, just
+    # an unterminated one.
     tail = data_start + n * stride
     truncated = scan_end - tail < hdr_size
     if not truncated:
@@ -728,18 +961,48 @@ def _uniform_run(
 
 
 def _walk(
-    mm: np.ndarray, data_start: int, scan_end: int, version: TwixVersion, header_dtype: np.dtype
+    mm: np.ndarray,
+    data_start: int,
+    scan_end: int,
+    version: TwixVersion,
+    header_dtype: np.dtype,
 ) -> tuple[np.ndarray, bool]:
     """Step block by block, recording the ADC lines and skipping the rest.
 
-    Deliberately plain: one Python iteration per *block*, which is affordable exactly where
-    this path is needed, since interleaved acquisitions are interleaved because their lines
-    are large.
+    Deliberately plain: one Python iteration per *block*, which is affordable exactly
+    where this path is needed, since interleaved acquisitions are interleaved because
+    their lines are large.
+
+    Parameters
+    ----------
+    mm : numpy.ndarray
+        The whole file as a ``uint8`` array.
+    data_start : int
+        Byte offset of the first block.
+    scan_end : int
+        Byte offset one past the end of this measurement.
+    version : TwixVersion
+        The layout detected by `detect_version`.
+    header_dtype : numpy.dtype
+        The scan-header dtype for `version`.
+
+    Returns
+    -------
+    table : numpy.ndarray
+        A `LINE_DTYPE` array with one row per ADC line.
+    truncated : bool
+        Whether the walk ran out of bytes before reaching ACQEND.
+
+    Raises
+    ------
+    UnsupportedLayoutError
+        If a line's shape differs from the first line's, or if a line starts at an
+        offset that is not 8-byte aligned.
     """
     hdr_size = header_dtype.itemsize
-    prefix, chan_hdr = header_sizes(version)
-    acqend_bit = np.uint64(int(Flag.ACQEND))
-    sync_bit = np.uint64(int(Flag.SYNCDATA))
+    prefix, chan_hdr = HEADER_SIZES[version]
+    acqend_bit = np.uint64(Flag.ACQEND)
+    sync_bit = np.uint64(Flag.SYNCDATA)
 
     rows: list[tuple] = []
     ncol = ncha = -1
@@ -765,17 +1028,19 @@ def _walk(
             continue
 
         line_ncol, line_ncha = int(header["SamplesInScan"]), int(header["UsedChannels"])
-        if ncol < 0:
+        if ncol < 0:  # first line: record its shape for the rest of the measurement
             ncol, ncha = line_ncol, line_ncha
         elif (line_ncol, line_ncha) != (ncol, ncha):
             raise UnsupportedLayoutError(
-                f"line {len(rows)} has shape (ncha={line_ncha}, ncol={line_ncol}) instead "
-                f"of ({ncha}, {ncol}); turbotwix reads one shape per measurement. "
+                f"line {len(rows)} has shape (ncha={line_ncha}, ncol={line_ncol}) "
+                f"instead of ({ncha}, {ncol}); turbotwix reads one shape per "
+                f"measurement. "
                 f"{_USE_A_REFERENCE_READER}"
             )
         if pos % 8:
             raise UnsupportedLayoutError(
-                f"line {len(rows)} starts at unaligned offset {pos}. {_USE_A_REFERENCE_READER}"
+                f"line {len(rows)} starts at unaligned offset {pos}. "
+                f"{_USE_A_REFERENCE_READER}"
             )
         length = prefix + line_ncha * (chan_hdr + 8 * line_ncol)
         if length <= 0 or pos + length > scan_end:
@@ -788,15 +1053,34 @@ def _walk(
     return np.array(rows, dtype=LINE_DTYPE), truncated
 
 
-def read_headers(mm: np.ndarray, offsets: np.ndarray, version: TwixVersion) -> np.ndarray:
+def read_headers(
+    mm: np.ndarray, offsets: np.ndarray, version: TwixVersion
+) -> np.ndarray:
     """Materialize the full VB/VD scan headers of the lines at `offsets`.
 
-    Everything the compact table leaves out lives here: slice position and orientation, ICE
-    program parameters (where custom non-Cartesian sequences usually stash trajectory or
-    interleaf indices), timestamps, centre indices.
+    Everything the compact table leaves out lives here: slice position and orientation,
+    ICE program parameters (where custom non-Cartesian sequences usually stash
+    trajectory or interleaf indices), timestamps, centre indices.
+
+    Parameters
+    ----------
+    mm : numpy.ndarray
+        The whole file as a ``uint8`` array.
+    offsets : numpy.ndarray
+        Absolute byte offsets of the scan headers to read, as in `LineTable.offset`.
+    version : TwixVersion
+        The layout detected by `detect_version`.
+
+    Returns
+    -------
+    numpy.ndarray
+        A contiguous `(len(offsets),)` array of `VB_HEADER` or `VD_SCAN_HEADER` records.
     """
-    dtype = scan_header_dtype(version)
-    idx = np.asarray(offsets, dtype=np.int64)[:, None] + np.arange(dtype.itemsize)[None, :]
+    dtype = SCAN_HEADER_DTYPES[version]
+    idx = (
+        np.asarray(offsets, dtype=np.int64)[:, None]
+        + np.arange(dtype.itemsize)[None, :]
+    )
     return np.ascontiguousarray(mm[idx]).view(dtype).reshape(len(idx))
 
 
@@ -804,8 +1088,8 @@ def read_headers(mm: np.ndarray, offsets: np.ndarray, version: TwixVersion) -> n
 # 5. Sample extraction
 # ---------------------------------------------------------------------------
 
-# Un-reflecting is a fancy-index assignment, so it needs a temporary the size of the lines
-# it touches; this bounds that temporary without bounding anything else.
+# Un-reflecting is a fancy-index assignment, so it needs a temporary the size of the
+# lines it touches; this bounds that temporary without bounding anything else.
 _FLIP_BUDGET_BYTES = 2 * 1024 * 1024
 
 
@@ -817,15 +1101,38 @@ def read_lines(
     out: np.ndarray | None = None,
     reflect: bool = True,
 ) -> np.ndarray:
-    """Read the samples of every line in `table` into a `(len(table), ncha, ncol)` array.
+    """Read every line in `table` into a `(len(table), ncha, ncol)` array.
 
-    That shape *is* the file's own layout — one contiguous `(ncha, ncol)` block per line,
-    in file order — so reading is a strided copy: no index arithmetic, no gather and no
+    That shape *is* the file's own layout — one contiguous `(ncha, ncol)` block per
+    line, in file order — so reading is a strided copy: no index arithmetic, no gather
+    and no
     intermediate buffer, which is what makes an `out=` memmap enough to read files far
     larger than RAM.
 
-    `reflect` un-reverses the lines flagged REFLECT (bipolar readouts store them
-    backwards); pass False for the samples exactly as laid down on disk.
+    Parameters
+    ----------
+    mm : numpy.ndarray
+        The whole file as a ``uint8`` array.
+    table : numpy.ndarray
+        A `LINE_DTYPE` array selecting the lines to read, as in `LineTable.rows`.
+    version : TwixVersion
+        The layout detected by `detect_version`.
+    out : numpy.ndarray, optional
+        Preallocated `(len(table), ncha, ncol)` complex64 destination — a
+        `numpy.memmap`, a slice of a bigger array. Allocated if not given.
+    reflect : bool, default True
+        Un-reverse the lines flagged REFLECT (bipolar readouts store them backwards).
+        Pass False for the samples exactly as laid down on disk.
+
+    Returns
+    -------
+    numpy.ndarray
+        The `(len(table), ncha, ncol)` complex64 samples; `out` itself when given.
+
+    Raises
+    ------
+    ValueError
+        If `out` does not have the required shape and dtype.
     """
     n = len(table)
     ncha, ncol = (int(table["ncha"][0]), int(table["ncol"][0])) if n else (0, 0)
@@ -837,25 +1144,29 @@ def read_lines(
     if n == 0:
         return out
 
-    prefix, chan_hdr = header_sizes(version)
+    prefix, chan_hdr = HEADER_SIZES[version]
     block = chan_hdr + 8 * ncol  # one channel: its header, then its samples
     # Index in complex64 units, not bytes: `build_table` has verified that every offset
     # involved is a multiple of 8.
     c8 = np.asarray(mm[: (mm.size // 8) * 8].view("<c8"))
     starts = (table["offset"].astype(np.int64) + prefix + chan_hdr) // 8
 
-    # An index-array gather would need an int64 index per complex64 sample — as much index
-    # traffic as data traffic — where a strided view is a plain memcpy. Evenly spaced lines
-    # (the norm, since a measurement is usually one uniform run) are a single view for the
-    # whole selection; an irregular selection is one view per line, each still at a fixed
-    # within-line stride.
+    # An index-array gather would need an int64 index per complex64 sample — as much
+    # index traffic as data traffic — where a strided view is a plain memcpy. Evenly
+    # spaced lines (the norm, since a measurement is usually one uniform run) are a
+    # single view for the whole selection; an irregular selection is one view per line,
+    # each still at a fixed within-line stride.
     step = int(starts[1] - starts[0]) if n > 1 else 0
     if step > 0 and np.all(np.diff(starts) == step):
-        view = as_strided(c8[int(starts[0]) :], shape=shape, strides=(8 * step, block, 8))
+        view = as_strided(
+            c8[int(starts[0]) :], shape=shape, strides=(8 * step, block, 8)
+        )
         np.copyto(out, view)
     else:
         for i, start in enumerate(starts):
-            out[i] = as_strided(c8[int(start) :], shape=(ncha, ncol), strides=(block, 8))
+            out[i] = as_strided(
+                c8[int(start) :], shape=(ncha, ncol), strides=(block, 8)
+            )
 
     if reflect:
         idx = np.flatnonzero(has_flag(table["flags"], Flag.REFLECT))
@@ -864,18 +1175,6 @@ def read_lines(
             picked = idx[at : at + chunk]
             out[picked] = out[picked][:, :, ::-1]
     return out
-
-
-def remove_oversampling(samples: np.ndarray, axis: int = -1) -> np.ndarray:
-    """Crop a readout axis to its central half via an FFT round-trip (2x oversampling).
-
-    Kept out of the read path on purpose: it is signal processing, not I/O, it costs a full
-    complex round-trip over the data, and along a non-Cartesian readout (spiral, radial) it
-    is not a meaningful operation at all.
-    """
-    n = samples.shape[axis]
-    keep = np.concatenate([np.arange(n // 4), np.arange(3 * n // 4, n)])
-    return np.fft.fft(np.fft.ifft(samples, axis=axis).take(keep, axis=axis), axis=axis)
 
 
 # ---------------------------------------------------------------------------
@@ -893,7 +1192,11 @@ _NOT_IMAGING = (
     | Flag.REFPHASESTABSCAN
 )
 _NOT_PLAIN_REFERENCE = (
-    Flag.PHASCOR | Flag.PHASESTABSCAN | Flag.REFPHASESTABSCAN | Flag.RTFEEDBACK | Flag.HPFEEDBACK
+    Flag.PHASCOR
+    | Flag.PHASESTABSCAN
+    | Flag.REFPHASESTABSCAN
+    | Flag.RTFEEDBACK
+    | Flag.HPFEEDBACK
 )
 
 
@@ -902,6 +1205,15 @@ class LineTable:
 
     Indexing returns another `LineTable`, so selections compose:
     `m.lines.image[m.lines.image.counter("Rep") == 0]`.
+
+    Parameters
+    ----------
+    rows : numpy.ndarray
+        A `LINE_DTYPE` array, one row per ADC line.
+    mm : numpy.ndarray
+        The whole file as a ``uint8`` array, kept so `headers` can re-read from it.
+    version : TwixVersion
+        The layout detected by `detect_version`.
     """
 
     def __init__(self, rows: np.ndarray, mm: np.ndarray, version: TwixVersion) -> None:
@@ -927,19 +1239,13 @@ class LineTable:
 
     @property
     def offset(self) -> np.ndarray:
+        """Absolute byte offset of each line's scan header."""
         return self._rows["offset"]
 
     @property
     def flags(self) -> np.ndarray:
+        """Each line's 64-bit `EvalInfoMask`. Query it with `has` / `has_any`."""
         return self._rows["flags"]
-
-    @property
-    def ncol(self) -> np.ndarray:
-        return self._rows["ncol"]
-
-    @property
-    def ncha(self) -> np.ndarray:
-        return self._rows["ncha"]
 
     @property
     def counters(self) -> np.ndarray:
@@ -947,6 +1253,18 @@ class LineTable:
         return self._rows["counters"]
 
     def counter(self, name: str) -> np.ndarray:
+        """One loop counter's value for every line.
+
+        Parameters
+        ----------
+        name : str
+            A counter name from `COUNTERS`, e.g. ``"Lin"``.
+
+        Returns
+        -------
+        numpy.ndarray
+            The `(N,)` int64 counter values.
+        """
         return self._rows["counters"][name].astype(np.int64)
 
     @property
@@ -954,28 +1272,67 @@ class LineTable:
         """The `(ncha, ncol)` shape of every line — one measurement, one shape."""
         if len(self) == 0:
             return (0, 0)
-        return (int(self.ncha[0]), int(self.ncol[0]))
+        return (int(self._rows["ncha"][0]), int(self._rows["ncol"][0]))
 
     def headers(self) -> np.ndarray:
-        """The full VB/VD scan headers of these lines, re-read from the file."""
+        """The full VB/VD scan headers of these lines, re-read from the file.
+
+        Returns
+        -------
+        numpy.ndarray
+            A `(len(self),)` array of `VB_HEADER` or `VD_SCAN_HEADER` records.
+        """
         return read_headers(self._mm, self.offset, self._version)
 
     # -- selection ---------------------------------------------------------
     def has(self, flag: Flag) -> np.ndarray:
-        """Boolean mask of lines carrying *all* bits of `flag`."""
+        """Boolean mask of lines carrying *all* bits of `flag`.
+
+        Parameters
+        ----------
+        flag : Flag
+            The bit or combination of bits to test for.
+
+        Returns
+        -------
+        numpy.ndarray
+            Boolean `(len(self),)` mask.
+        """
         return has_flag(self.flags, flag)
 
     def has_any(self, flag: Flag) -> np.ndarray:
-        """Boolean mask of lines carrying *any* bit of `flag`."""
+        """Boolean mask of lines carrying *any* bit of `flag`.
+
+        Parameters
+        ----------
+        flag : Flag
+            The bits to test for.
+
+        Returns
+        -------
+        numpy.ndarray
+            Boolean `(len(self),)` mask.
+        """
         return has_any_flag(self.flags, flag)
 
     def select(self, flag: Flag) -> LineTable:
-        """The lines carrying all bits of `flag`."""
+        """The lines carrying all bits of `flag`.
+
+        Parameters
+        ----------
+        flag : Flag
+            The bit or combination of bits to select on.
+
+        Returns
+        -------
+        LineTable
+            The matching lines.
+        """
         return self[self.has(flag)]
 
     @property
     def image(self) -> LineTable:
-        """Imaging lines: everything but calibration, feedback and reference-only lines."""
+        """Imaging lines: all but calibration, feedback and reference-only lines."""
         return self[~self.has_any(_NOT_IMAGING) & ~self._reference_only]
 
     @property
@@ -996,39 +1353,126 @@ class LineTable:
 
     @property
     def _reference_only(self) -> np.ndarray:
-        """PATREFSCAN without PATREFANDIMASCAN: reference data that is not also image."""
+        """PATREFSCAN without PATREFANDIMASCAN: reference that is not also image."""
         return self.has(Flag.PATREFSCAN) & ~self.has(Flag.PATREFANDIMASCAN)
+
+
+def _varying_counters(lines: LineTable) -> tuple[str, ...]:
+    """The loop counters that are not constant over `lines`, in header order.
+
+    A counter varies iff its min differs from its max — two reductions, not a sort.
+    Taken over the counter block as one contiguous `(n, 14)` uint16 array rather than
+    field by field, since 14 passes strided across 48-byte rows cost twice what one
+    compacted pass does (50 ms vs 25 ms on a million lines).
+
+    Never empty: with nothing varying there is no grid at all, and `("Lin",)` gives the
+    degenerate size-1 axis instead of a rank-0 one.
+
+    Parameters
+    ----------
+    lines : LineTable
+        The lines to inspect.
+
+    Returns
+    -------
+    tuple of str
+        The names of the varying counters, in header order; ``("Lin",)`` if none vary.
+    """
+    if len(lines) == 0:
+        return ("Lin",)
+    flat = np.ascontiguousarray(lines.counters).view("<u2")
+    counters = np.reshape(flat, (len(lines), len(COUNTERS)))
+    lo, hi = counters.min(0), counters.max(0)
+    varying = tuple(name for name, a, b in zip(COUNTERS, lo, hi, strict=True) if a != b)
+    return varying or ("Lin",)
+
+
+def minimal_dims(lines: LineTable) -> tuple[str, ...]:
+    """The varying counters, minus those the others already determine.
+
+    `varying_counters` never collides, but takes the *product* of the counter ranges
+    even when they are correlated: an EPI `Seg` that merely tracks `Lin` parity doubles
+    the grid and leaves half of it empty. A counter can be dropped exactly when the
+    remaining ones still identify every line — i.e. when it is a function of them —
+    which is one uniqueness test per candidate, tried largest-first and stopped as soon
+    as the grid is perfectly packed.
+
+    Nothing is *lost* by dropping a determined counter: it is recoverable from what is
+    kept, by definition. What is lost is an axis to slice on — folding EPI on `Lin`
+    alone leaves no way to address the two readout polarities separately — so this is
+    opt-in, not
+    the meaning of `dims=None`.
+
+    Parameters
+    ----------
+    lines : LineTable
+        The lines the grid is to be built from.
+
+    Returns
+    -------
+    tuple of str
+        The counter names to fold on, a subset of `_varying_counters`.
+    """
+    dims = list(_varying_counters(lines))
+    n = len(lines)
+    columns = {d: lines.counter(d) - int(lines.counter(d).min()) for d in dims}
+    sizes = {d: int(columns[d].max()) + 1 for d in dims}
+    slots = int(np.prod([sizes[d] for d in dims]))
+    if slots >= 2**62:
+        return tuple(dims)  # the packed key would overflow int64; not worth a wider one
+
+    for candidate in sorted(dims, key=lambda d: -sizes[d]):
+        if slots == n or len(dims) == 1:
+            break  # perfectly packed, or down to the last axis: nothing left to gain
+        trial = [d for d in dims if d != candidate]
+        key = np.zeros(n, dtype=np.int64)
+        for d in trial:
+            key = key * sizes[d] + columns[d]
+        if len(np.unique(key)) == n:
+            dims, slots = trial, slots // sizes[candidate]
+    return tuple(dims)
 
 
 def to_dense(
     samples: np.ndarray,
     lines: LineTable,
-    dims: tuple[str, ...] = ("Lin", "Par"),
-    *,
-    reduce: str = "error",
-    origin: str = "min",
+    dims: tuple[str, ...] | str = "minimal",
 ) -> np.ndarray:
     """Fold `(n_lines, ncha, ncol)` samples onto a grid indexed by loop counters.
 
-    Returns an array shaped `(*dim_sizes, ncha, ncol)`.
+    Parameters
+    ----------
+    samples : numpy.ndarray
+        The `(n_lines, ncha, ncol)` samples, as returned by `read_lines`.
+    lines : LineTable
+        The lines `samples` was read from, in the same order.
+    dims : tuple of str or {'minimal'}, default 'minimal'
+        The counter names to use as grid axes. ``"minimal"`` drops the counters the
+        others already determine (`minimal_dims`), which packs the grid but costs an
+        axis you may have wanted to slice on. Naming the dims keeps both the rank and
+        the memory predictable.
 
-    `reduce` decides what happens when several lines land on the same index — which
-    normally means a counter is missing from `dims`, not that the data wants averaging. So
-    the default is to raise and say which; pass "mean", "sum" or "last" to opt in.
-    `origin="min"` shifts each axis so the acquired range starts at 0 (the useful default
-    for reference and navigator scans, which cover part of k-space); `origin="zero"` keeps
-    the raw counter values, i.e. the nominal matrix.
+    Returns
+    -------
+    numpy.ndarray
+        An array shaped `(*dim_sizes, ncha, ncol)`, zero where no line was acquired.
+
+    Raises
+    ------
+    ValueError
+        If `samples` and `lines` differ in length, or if explicit `dims` leave several
+        lines landing on one grid position.
     """
     if len(samples) != len(lines):
         raise ValueError(f"samples has {len(samples)} lines, table has {len(lines)}")
-    if reduce not in ("error", "mean", "sum", "last"):
-        raise ValueError("reduce must be 'error', 'mean', 'sum' or 'last'")
-    if origin not in ("min", "zero"):
-        raise ValueError("origin must be 'min' or 'zero'")
+    minimal = False
+    if dims == "minimal":
+        dims = minimal_dims(lines)
+        minimal = True
 
     idx = [lines.counter(name) for name in dims]
-    if origin == "min":
-        idx = [values - int(values.min()) for values in idx]
+    # shift the grid so the acquired range starts at 0.
+    idx = [values - int(values.min()) for values in idx]
     sizes = [int(values.max()) + 1 for values in idx]
     flat = np.ravel_multi_index(tuple(idx), sizes)
 
@@ -1036,41 +1480,46 @@ def to_dense(
     dense = np.zeros((n_flat, *samples.shape[1:]), dtype=samples.dtype)
     counts = np.bincount(flat, minlength=n_flat)
 
-    if counts.max(initial=0) > 1:
-        if reduce == "error":
-            varying = [
-                name
-                for name in COUNTERS
-                if name not in dims and len(np.unique(lines.counter(name))) > 1
-            ]
-            raise ValueError(
-                f"{int((counts > 1).sum())} grid positions receive more than one line. "
-                + (
-                    f"Counters varying but not in dims: {varying}."
-                    if varying
-                    else "The same counter tuple is acquired repeatedly."
-                )
-                + " Add them to dims, or pass reduce='mean'/'sum'/'last'."
-            )
-        if reduce == "last":
-            dense[flat] = samples
-        else:
-            np.add.at(dense, flat, samples)
-            if reduce == "mean":
-                dense /= np.maximum(counts, 1).reshape(-1, *(1,) * (dense.ndim - 1))
+    if counts.max(initial=0) > 1 and not minimal:
+        # probably going to delete all of this
+        varying = [
+            name
+            for name in COUNTERS
+            if name not in dims and len(np.unique(lines.counter(name))) > 1
+        ]
+        raise ValueError(
+            f"{int((counts > 1).sum())} grid positions receive more than one line. "
+            + (f"Counters varying but not in dims: {varying}.")
+        )
     else:
-        dense[flat] = samples  # no collisions: a plain scatter, far faster than np.add.at
+        dense[flat] = samples
 
     return dense.reshape(*sizes, *samples.shape[1:])
 
 
 class Measurement:
-    """One measurement (raid entry) inside a `.dat` file."""
+    """One measurement (raid entry) inside a `.dat` file.
+
+    Parameters
+    ----------
+    file : TwixFile
+        The open file this measurement belongs to.
+    entry : RaidEntry
+        Its directory entry: id, offset, length and names.
+    index : int
+        Its position in the file, in acquisition order.
+    """
 
     def __init__(self, file: TwixFile, entry: RaidEntry, index: int) -> None:
         self._file = file
         self.index = index
-        self.meas_id, self.offset, self.length, self.patient_name, self.protocol_name = entry
+        (
+            self.meas_id,
+            self.offset,
+            self.length,
+            self.patient_name,
+            self.protocol_name,
+        ) = entry
 
     def __repr__(self) -> str:
         return (
@@ -1089,15 +1538,31 @@ class Measurement:
 
     @functools.cached_property
     def lines(self) -> LineTable:
-        """The acquisition lines of this measurement."""
+        """The acquisition lines of this measurement.
+
+        Raises
+        ------
+        TruncatedFileError
+            If the measurement ends before ACQEND and the file was not opened with
+            ``allow_truncated=True``.
+
+        Warns
+        -----
+        UserWarning
+            When a truncated measurement is read anyway, giving the line count kept.
+        """
         data_start = self.offset + self._header[1]
         rows, truncated = build_table(
             self._file.mm, data_start, self.offset + self.length, self._file.version
         )
         if truncated:
-            message = f"measurement {self.index} ended before ACQEND after {len(rows)} lines"
+            message = (
+                f"measurement {self.index} ended before ACQEND after {len(rows)} lines"
+            )
             if not self._file.allow_truncated:
-                raise TruncatedFileError(f"{message}; pass allow_truncated=True to read anyway")
+                raise TruncatedFileError(
+                    f"{message}; pass allow_truncated=True to read anyway"
+                )
             warnings.warn(f"{message}; using the acquired lines only", stacklevel=2)
         return LineTable(rows, self._file.mm, self._file.version)
 
@@ -1110,38 +1575,92 @@ class Measurement:
     ) -> np.ndarray:
         """Read the samples of `lines` (default: all of them) into `(n, ncha, ncol)`.
 
-        Pass `out=` to read into a preallocated buffer — a `np.memmap`, a slice of a bigger
-        array — which is what makes files larger than RAM readable, since the copy goes
-        straight from the mapped file into it with nothing in between.
+        Parameters
+        ----------
+        lines : LineTable, optional
+            The lines to read; every line of the measurement by default.
+        out : numpy.ndarray, optional
+            Preallocated `(n, ncha, ncol)` complex64 destination — a `numpy.memmap`, a
+            slice of a bigger array — which is what makes files larger than RAM
+            readable, since the copy goes straight from the mapped file into it with
+            nothing in between.
+        reflect : bool, default True
+            Un-reverse the lines flagged REFLECT.
+
+        Returns
+        -------
+        numpy.ndarray
+            The `(n, ncha, ncol)` complex64 samples; `out` itself when given.
         """
         table = self.lines if lines is None else lines
-        return read_lines(self._file.mm, table.rows, self._file.version, out=out, reflect=reflect)
+        return read_lines(
+            self._file.mm, table.rows, self._file.version, out=out, reflect=reflect
+        )
 
     def to_dense(
         self,
         lines: LineTable | None = None,
-        dims: tuple[str, ...] = ("Lin", "Par"),
+        dims: tuple[str, ...] | Literal["minimal"] = "minimal",
         *,
-        reduce: str = "error",
-        origin: str = "min",
         reflect: bool = True,
     ) -> np.ndarray:
-        """`read` followed by `to_dense` — convenience for Cartesian acquisitions."""
+        """Read the k-space data and return a dense array of it.
+
+        Parameters
+        ----------
+        lines : LineTable, optional
+            The lines to fold; the imaging lines of the measurement by default.
+        dims : tuple of str or str, optional
+            The counter names to use as grid axes, as for `to_dense`.
+        reflect : bool, default True
+            Un-reverse the lines flagged REFLECT.
+
+        Returns
+        -------
+        numpy.ndarray
+            An array shaped `(*dim_sizes, ncha, ncol)`.
+        """
         table = self.lines.image if lines is None else lines
         samples = self.read(table, reflect=reflect)
-        return to_dense(samples, table, dims, reduce=reduce, origin=origin)
+        return to_dense(samples, table, dims)
 
 
 class TwixFile:
-    """A memory-mapped `.dat` file and the measurements it contains."""
+    """A memory-mapped `.dat` file and the measurements it contains.
+
+    Indexable and iterable over its `Measurement` objects, in acquisition order. `scan`
+    is the last of them — the actual scan, rather than the adjustments before it — and
+    `hdr`, `lines`, `read` and `to_dense` are shorthands for its members, so the common
+    case needs no indexing at all.
+
+    Parameters
+    ----------
+    path : str
+        Path to the `.dat` file.
+    allow_truncated : bool, default False
+        Read a measurement that ends before ACQEND, warning instead of raising.
+
+    Raises
+    ------
+    TwixParseError
+        If the file holds no non-empty measurement.
+    UnsupportedVersionError
+        If the file does not look like a VB or VD/VE twix file.
+
+    Examples
+    --------
+    >>> f = open_twix("meas.dat")
+    >>> samples = f.read(f.lines.image)  # the last measurement
+    >>> noise = f[0].lines.noise  # an earlier one, explicitly
+    """
 
     def __init__(self, path: str, *, allow_truncated: bool = False) -> None:
         self.path = path
         self.allow_truncated = allow_truncated
-        self.mm = open_mmap(path)
+        self._mm = open_mmap(path)
         self.version = detect_version(self.mm)
-        # Zero-length entries are aborted measurements with no data written; the complete
-        # ones around them stay readable.
+        # Zero-length entries are aborted measurements with no data written; the
+        # complete ones around them stay readable.
         self.measurements = [
             Measurement(self, entry, index)
             for index, entry in enumerate(parse_raid_directory(self.mm, self.version))
@@ -1149,6 +1668,82 @@ class TwixFile:
         ]
         if not self.measurements:
             raise TwixParseError(f"{path}: no non-empty measurement")
+
+    @property
+    def mm(self) -> np.ndarray:
+        """The mapped file. Raises `ValueError` once `close` has been called."""
+        if self._mm is None:
+            raise ValueError(f"{self.path} is closed")
+        return self._mm
+
+    def close(self) -> None:
+        """Drop this object's reference to the mapping.
+
+        The mapping itself goes away once nothing else holds it — a `LineTable` keeps
+        its own reference, so tables built before `close` stay readable. Nothing
+        turbotwix returns is a view of the file (samples, headers and protocol buffers
+        are all copies), so closing can never invalidate data you already hold.
+
+        Optional: the mapping is released on garbage collection anyway. Call it, or use
+        the file as a context manager, when you want the descriptor released at a
+        definite point — looping over many files, or on Windows, where an open mapping
+        blocks renaming and deleting the `.dat`.
+        """
+        self._mm = None
+
+    def __enter__(self) -> TwixFile:
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    @property
+    def scan(self) -> Measurement:
+        """The last measurement — the one you almost always want.
+
+        A `.dat` file is written in acquisition order, and a scan is commonly preceded
+        by the adjustments it needed (coil sensitivity, noise). The interesting one is
+        therefore the last, and `hdr`, `lines`, `read` and `to_dense` on the file are
+        shorthands for the same members of this measurement. Index the file (`f[0]`,
+        `f[-2]`) or iterate it to reach the others.
+        """
+        return self.measurements[-1]
+
+    @property
+    def hdr(self) -> Protocol:
+        """`scan.hdr` — the parsed text protocol of the last measurement."""
+        return self.scan.hdr
+
+    @property
+    def lines(self) -> LineTable:
+        """`scan.lines` — the acquisition lines of the last measurement."""
+        return self.scan.lines
+
+    def read(
+        self,
+        lines: LineTable | None = None,
+        *,
+        out: np.ndarray | None = None,
+        reflect: bool = True,
+    ) -> np.ndarray:
+        """`scan.read(...)` — read the last measurement's samples.
+
+        See `Measurement.read`.
+        """
+        return self.scan.read(lines, out=out, reflect=reflect)
+
+    def to_dense(
+        self,
+        lines: LineTable | None = None,
+        dims: tuple[str, ...] | Literal["minimal"] = "minimal",
+        *,
+        reflect: bool = True,
+    ) -> np.ndarray:
+        """`scan.to_dense(...)` — fold the last measurement onto a grid.
+
+        See `Measurement.to_dense`.
+        """
+        return self.scan.to_dense(lines, dims, reflect=reflect)
 
     def __len__(self) -> int:
         return len(self.measurements)
@@ -1161,7 +1756,10 @@ class TwixFile:
 
     def __repr__(self) -> str:
         names = [m.protocol_name for m in self.measurements]
-        return f"TwixFile({self.path!r}, version={self.version.name}, measurements={names})"
+        return (
+            f"TwixFile({self.path!r}, version={self.version.name}, "
+            f"measurements={names})"
+        )
 
 
 def open_twix(path: str, *, allow_truncated: bool = False) -> TwixFile:
@@ -1170,8 +1768,22 @@ def open_twix(path: str, *, allow_truncated: bool = False) -> TwixFile:
     Nothing is read beyond the raid directory: protocols and line tables are parsed per
     measurement on first access.
 
-    Every measurement in the file is returned, in file order — a scan is commonly preceded
-    by calibration measurements (coil sensitivity, noise), and which one you want is your
-    choice to make, not a default to inherit.
+    Every measurement in the file is kept, in acquisition order. Reads default to the
+    last one (`TwixFile.scan`), which is the scan itself — the measurements before it
+    are the adjustments it needed — while `f[0]`, `f[-2]` and iteration reach the rest.
+
+    Closing is optional; see `TwixFile.close`.
+
+    Parameters
+    ----------
+    path : str
+        Path to the `.dat` file.
+    allow_truncated : bool, default False
+        Read a measurement that ends before ACQEND, warning instead of raising.
+
+    Returns
+    -------
+    TwixFile
+        The open file, indexable and iterable over its `Measurement` objects.
     """
     return TwixFile(path, allow_truncated=allow_truncated)

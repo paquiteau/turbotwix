@@ -61,21 +61,3 @@ def test_parity_pymapvbvd_dense_image(gre_path):
     got = tw.to_dense(m.read(lines), lines, ("Lin",))  # (Lin, Cha, Col)
 
     np.testing.assert_array_equal(got.transpose(2, 1, 0), ref)
-
-
-@pytest.mark.skipif(not HAS_PYMAPVBVD, reason="pymapvbvd not installed")
-def test_parity_pymapvbvd_remove_os(gre_path):
-    import mapvbvd
-
-    ref_scan = mapvbvd.mapVBVD(gre_path, quiet=True)
-    if isinstance(ref_scan, list):
-        ref_scan = ref_scan[-1]
-    ref_scan.image.flagRemoveOS = True
-    ref_scan.image.flagRampSampRegrid = False
-    ref = np.squeeze(ref_scan.image[tuple([slice(None)] * 16)])
-
-    m = tw.open_twix(gre_path)[-1]
-    lines = m.lines.image
-    got = tw.to_dense(tw.remove_oversampling(m.read(lines)), lines, ("Lin",))
-
-    np.testing.assert_allclose(got.transpose(2, 1, 0), ref, atol=1e-4)

@@ -19,8 +19,8 @@ def test_dtype_sizes():
 
 
 def test_header_sizes_match_dtypes():
-    assert tw.header_sizes(tw.TwixVersion.VD) == (192, 32)
-    assert tw.header_sizes(tw.TwixVersion.VB) == (0, 128)
+    assert tw.HEADER_SIZES[tw.TwixVersion.VD] == (192, 32)
+    assert tw.HEADER_SIZES[tw.TwixVersion.VB] == (0, 128)
 
 
 def test_flags_cover_all_64_bits():
@@ -40,7 +40,7 @@ def test_has_flag_requires_every_named_bit():
 
 def test_counters_are_the_14_loop_counters():
     assert len(tw.COUNTERS) == 14
-    assert tw.COUNTERS[:4] == ("Lin", "Ave", "Sli", "Par")
+    assert tw.COUNTERS[:4] == ["Lin", "Ave", "Sli", "Par"]
 
 
 def test_detect_version_and_raid_directory(gre_path, epi_path):

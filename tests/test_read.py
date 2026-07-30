@@ -29,12 +29,16 @@ def test_read_lines_unreflects_by_default():
     np.testing.assert_array_equal(
         tw.read_lines(mm, table, VD), np.stack([expected[0], expected[1][:, ::-1]])
     )
-    np.testing.assert_array_equal(tw.read_lines(mm, table, VD, reflect=False), np.stack(expected))
+    np.testing.assert_array_equal(
+        tw.read_lines(mm, table, VD, reflect=False), np.stack(expected)
+    )
 
 
 def test_read_lines_unreflects_in_bounded_chunks(monkeypatch):
     # The flip is chunked to bound its temporary; the chunking must not be observable.
-    mm, table, expected = build([(4, 2, 100 * k, int(Flag.REFLECT) * (k % 2)) for k in range(9)])
+    mm, table, expected = build(
+        [(4, 2, 100 * k, int(Flag.REFLECT) * (k % 2)) for k in range(9)]
+    )
     monkeypatch.setattr(tw, "_FLIP_BUDGET_BYTES", 1)
     np.testing.assert_array_equal(
         tw.read_lines(mm, table, VD),
@@ -63,18 +67,9 @@ def test_read_lines_irregularly_spaced_selection():
     mm, table, expected = build([(4, 2, 100 * k, 0) for k in range(6)])
     for picked in ([0, 1, 2], [0, 1, 3], [5, 0], [2]):
         np.testing.assert_array_equal(
-            tw.read_lines(mm, table[picked], VD), np.stack([expected[i] for i in picked])
+            tw.read_lines(mm, table[picked], VD),
+            np.stack([expected[i] for i in picked]),
         )
-
-
-def test_remove_oversampling_crops_to_half():
-    rng = np.random.default_rng(0)
-    arr = rng.standard_normal((3, 2, 8)).astype(np.complex64)
-    assert tw.remove_oversampling(arr).shape == (3, 2, 4)
-    # n//4 kept from the front, n - 3n//4 from the back, so odd lengths do not round up.
-    for n, kept in ((7, 3), (8, 4), (11, 5), (15, 7), (16, 8)):
-        arr = rng.standard_normal((1, 1, n)).astype(np.complex64)
-        assert tw.remove_oversampling(arr).shape[-1] == kept
 
 
 # --- selection ------------------------------------------------------------
@@ -87,7 +82,10 @@ def test_selection_presets():
         ("noise", int(Flag.NOISEADJSCAN)),
         ("refscan", int(Flag.PATREFSCAN)),
         ("phasecor", int(Flag.PHASCOR)),
-        ("refscanPC", int(Flag.PATREFSCAN | Flag.PHASCOR)),  # reference-only, not phasecor
+        (
+            "refscanPC",
+            int(Flag.PATREFSCAN | Flag.PHASCOR),
+        ),  # reference-only, not phasecor
         ("feedback", int(Flag.RTFEEDBACK)),
     ]
     mm, table, _ = build([(4, 2, 0, mask) for _, mask in kinds])
@@ -128,41 +126,106 @@ def test_to_dense_folds_onto_chosen_counters(gre_path):
     np.testing.assert_array_equal(m.to_dense(dims=("Lin",)), dense)
 
 
-def test_to_dense_refuses_to_average_silently():
-    # Two lines with the same Lin but different Rep: folding on Lin alone collides.
-    mm, table, expected = build([(4, 2, 100, 0), (4, 2, 200, 0)])
-    table["counters"]["Lin"] = [0, 0]
-    table["counters"]["Rep"] = [0, 1]
+def test_dims_none_uses_the_counters_that_vary():
+    mm, table, expected = build([(4, 2, 100 * k, 0) for k in range(4)])
+    table["counters"]["Lin"] = [0, 0, 1, 1]
+    table["counters"]["Seg"] = [0, 1, 0, 1]
     lines = tw.LineTable(table, mm, VD)
     samples = np.stack(expected)
 
-    with pytest.raises(ValueError, match="Rep"):
-        tw.to_dense(samples, lines, ("Lin",))
-
-    np.testing.assert_allclose(
-        tw.to_dense(samples, lines, ("Lin",), reduce="mean")[0], (expected[0] + expected[1]) / 2
-    )
+    assert tw._varying_counters(lines) == ("Lin", "Seg")
+    assert tw.to_dense(samples, lines, None).shape == (2, 2, 2, 4)
+    # ... which is exactly what naming them does, and what the default cannot do here.
     np.testing.assert_array_equal(
-        tw.to_dense(samples, lines, ("Lin",), reduce="last")[0], expected[1]
+        tw.to_dense(samples, lines, None), tw.to_dense(samples, lines, ("Lin", "Seg"))
     )
-    assert tw.to_dense(samples, lines, ("Lin", "Rep")).shape == (1, 2, 2, 4)
+    with pytest.raises(ValueError, match="Seg"):
+        tw.to_dense(samples, lines, ("Lin", "Par"))
 
 
-def test_to_dense_origin_and_argument_checks():
-    mm, table, expected = build([(4, 2, 100, 0), (4, 2, 200, 0)])
-    table["counters"]["Lin"] = [10, 11]
+def test_minimal_dims_drops_determined_counters():
+    # Seg tracks Lin parity, as an EPI readout polarity does: it varies, so dims=None keeps
+    # it and leaves half the grid empty, but it adds nothing that Lin does not already say.
+    n = 8
+    mm, table, expected = build([(4, 2, 100 * k, 0) for k in range(n)])
+    table["counters"]["Lin"] = np.arange(n)
+    table["counters"]["Seg"] = np.arange(n) % 2
     lines = tw.LineTable(table, mm, VD)
     samples = np.stack(expected)
 
-    assert tw.to_dense(samples, lines, ("Lin",), origin="min").shape[0] == 2
-    assert tw.to_dense(samples, lines, ("Lin",), origin="zero").shape[0] == 12
+    assert tw._varying_counters(lines) == ("Lin", "Seg")
+    assert tw.minimal_dims(lines) == ("Lin",)
+    assert tw.to_dense(samples, lines, None).shape == (n, 2, 2, 4)  # half of it zeros
+    assert tw.to_dense(samples, lines, "minimal").shape == (n, 2, 4)
+    np.testing.assert_array_equal(tw.to_dense(samples, lines, "minimal"), samples)
 
-    with pytest.raises(ValueError, match="table has 2"):
-        tw.to_dense(samples[:1], lines, ("Lin",))
-    with pytest.raises(ValueError, match="reduce must be"):
-        tw.to_dense(samples, lines, ("Lin",), reduce="nope")
-    with pytest.raises(ValueError, match="origin must be"):
-        tw.to_dense(samples, lines, ("Lin",), origin="nope")
+
+def test_minimal_dims_keeps_genuinely_independent_counters():
+    # Ave and Seg each take both values and neither determines the other, so nothing may
+    # be dropped — the grid stays 2x2 for 3 lines.
+    mm, table, expected = build([(4, 2, 100 * k, 0) for k in range(3)])
+    table["counters"]["Lin"] = 40
+    table["counters"]["Seg"] = [1, 0, 1]
+    table["counters"]["Ave"] = [0, 0, 1]
+    lines = tw.LineTable(table, mm, VD)
+
+    assert tw._varying_counters(lines) == ("Ave", "Seg")
+    assert tw.minimal_dims(lines) == ("Ave", "Seg")
+    assert tw.to_dense(np.stack(expected), lines, "minimal").shape == (2, 2, 2, 4)
+
+
+def test_minimal_dims_on_real_files(gre_path, epi_path):
+    gre = tw.open_twix(gre_path)[-1]
+    assert tw.minimal_dims(gre.lines.image) == ("Lin",)  # nothing to drop
+
+    epi = tw.open_twix(epi_path)[-1]
+    lines = epi.lines.image
+    assert tw.minimal_dims(lines) == ("Lin",)  # Seg is the Lin parity
+    dense = epi.to_dense(lines, dims="minimal")
+    assert dense.shape == (80, 2, 160)
+    # Same samples as the padded grid, without the empty half.
+    padded = epi.to_dense(lines, dims=None)
+    np.testing.assert_array_equal(dense, padded.sum(axis=1))
+
+    # phasecor: Ave and Seg are independent, so the search declines to drop either.
+    assert tw.minimal_dims(epi.lines.phasecor) == ("Ave", "Seg")
+
+
+def test_to_dense_rejects_an_unknown_dims_string():
+    mm, table, expected = build([(4, 2, 100, 0)])
+    lines = tw.LineTable(table, mm, VD)
+    with pytest.raises(ValueError, match="None or 'minimal'"):
+        tw.to_dense(np.stack(expected), lines, "Lin")
+
+
+def test_dims_none_never_produces_a_rank_zero_grid():
+    # Nothing varies, so there is no grid: one degenerate axis, and a collision reported
+    # as what it is rather than as a missing counter.
+    mm, table, expected = build([(4, 2, 100, 0), (4, 2, 200, 0)])
+    table["counters"]["Lin"] = 0
+    lines = tw.LineTable(table, mm, VD)
+    assert tw._varying_counters(lines) == ("Lin",)
+    with pytest.raises(ValueError, match="acquired repeatedly"):
+        tw.to_dense(np.stack(expected), lines, None)
+    assert tw.to_dense(np.stack(expected), lines, None, reduce="last").shape == (
+        1,
+        2,
+        4,
+    )
+
+
+def test_dims_none_on_real_files(gre_path, epi_path):
+    gre = tw.open_twix(gre_path)[-1]
+    assert tw._varying_counters(gre.lines.image) == ("Lin",)
+    assert gre.to_dense(dims=None).shape == (160, 2, 320)
+
+    epi = tw.open_twix(epi_path)[-1]
+    lines = epi.lines.image
+    # Seg is the readout polarity, i.e. Lin parity: an axis whose product with Lin is
+    # half empty. Auto-dims cannot know that; naming ("Lin",) would collide, so this is
+    # the honest shape.
+    assert tw._varying_counters(lines) == ("Lin", "Seg")
+    assert epi.to_dense(lines, dims=None).shape == (80, 2, 2, 160)
 
 
 # --- the object model on real files ---------------------------------------
@@ -205,7 +268,9 @@ def test_read_returns_lines_not_a_hypercube(gre_path):
 def test_read_into_preallocated_buffer(gre_path, tmp_path):
     m = tw.open_twix(gre_path)[-1]
     lines = m.lines.image
-    dst = np.memmap(tmp_path / "out.dat", dtype=np.complex64, mode="w+", shape=(len(lines), 2, 320))
+    dst = np.memmap(
+        tmp_path / "out.dat", dtype=np.complex64, mode="w+", shape=(len(lines), 2, 320)
+    )
     m.read(lines, out=dst)
     np.testing.assert_array_equal(np.asarray(dst), m.read(lines))
 
@@ -225,7 +290,9 @@ def _truncated_copy(src: str, dst: pathlib.Path) -> str:
     version = tw.detect_version(mm)
     entry = tw.parse_raid_directory(mm, version)[-1]
     _, hdr_len = tw.parse_protocol(mm, entry.offset)
-    table, _ = tw.build_table(mm, entry.offset + hdr_len, entry.offset + entry.length, version)
+    table, _ = tw.build_table(
+        mm, entry.offset + hdr_len, entry.offset + entry.length, version
+    )
     stride = int(table["offset"][1] - table["offset"][0])
     keep = int(table["offset"][-1]) + stride  # first byte of the ACQEND header
 
@@ -248,4 +315,6 @@ def test_truncated_file_raises_unless_allowed(gre_path, tmp_path):
     assert len(lines.image) == 160
 
     reference = tw.open_twix(gre_path)[-1]
-    np.testing.assert_array_equal(m.read(lines.image), reference.read(reference.lines.image))
+    np.testing.assert_array_equal(
+        m.read(lines.image), reference.read(reference.lines.image)
+    )
