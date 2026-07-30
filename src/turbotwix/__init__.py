@@ -809,6 +809,7 @@ def open_mmap(path: str) -> np.memmap:
     if raw is not None:
         try:
             raw.madvise(_mmap.MADV_SEQUENTIAL)
+            raw.madvise(_mmap.MADV_WILLNEED)
         except (AttributeError, OSError):
             pass  # best-effort only; not every platform supports it
     return mm
