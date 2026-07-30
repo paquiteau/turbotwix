@@ -55,7 +55,6 @@ __all__ = [
     "UnsupportedVersionError",
     "open_twix",
     "minimal_dims",
-    "to_dense",
 ]
 
 
@@ -809,7 +808,6 @@ def open_mmap(path: str) -> np.memmap:
     if raw is not None:
         try:
             raw.madvise(_mmap.MADV_SEQUENTIAL)
-            raw.madvise(_mmap.MADV_WILLNEED)
         except (AttributeError, OSError):
             pass  # best-effort only; not every platform supports it
     return mm
@@ -1596,17 +1594,16 @@ def _fold_index(
     minimal : bool
         Whether `dims` came from `minimal_dims` (grid is known to be collision-free).
     """
-    minimal = False
-    if dims == "minimal":
-        dims = minimal_dims(lines)
-        minimal = True
+    minimal = dims == "minimal"
+    resolved_dims = minimal_dims(lines) if minimal else dims
+    assert not isinstance(resolved_dims, str)
 
-    idx = [lines.counter(name) for name in dims]
+    idx = [lines.counter(name) for name in resolved_dims]
     # shift the grid so the acquired range starts at 0.
     idx = [values - int(values.min()) for values in idx]
     sizes = [int(values.max()) + 1 for values in idx]
     flat = np.ravel_multi_index(tuple(idx), sizes)
-    return dims, flat, sizes, minimal
+    return resolved_dims, flat, sizes, minimal
 
 
 def _check_no_collisions(
@@ -1628,48 +1625,6 @@ def _check_no_collisions(
             f"{int((counts > 1).sum())} grid positions receive more than one line. "
             + (f"Counters varying but not in dims: {varying}.")
         )
-
-
-def to_dense(
-    samples: np.ndarray,
-    lines: LineTable,
-    dims: tuple[str, ...] | str = "minimal",
-) -> np.ndarray:
-    """Fold `(n_lines, ncha, ncol)` samples onto a grid indexed by loop counters.
-
-    Parameters
-    ----------
-    samples : numpy.ndarray
-        The `(n_lines, ncha, ncol)` samples, as returned by `read_lines`.
-    lines : LineTable
-        The lines `samples` was read from, in the same order.
-    dims : tuple of str or {'minimal'}, default 'minimal'
-        The counter names to use as grid axes. ``"minimal"`` drops the counters the
-        others already determine (`minimal_dims`), which packs the grid but costs an
-        axis you may have wanted to slice on. Naming the dims keeps both the rank and
-        the memory predictable.
-
-    Returns
-    -------
-    numpy.ndarray
-        An array shaped `(*dim_sizes, ncha, ncol)`, zero where no line was acquired.
-
-    Raises
-    ------
-    ValueError
-        If `samples` and `lines` differ in length, or if explicit `dims` leave several
-        lines landing on one grid position.
-    """
-    if len(samples) != len(lines):
-        raise ValueError(f"samples has {len(samples)} lines, table has {len(lines)}")
-    dims, flat, sizes, minimal = _fold_index(lines, dims)
-
-    n_flat = int(np.prod(sizes))
-    dense = np.zeros((n_flat, *samples.shape[1:]), dtype=samples.dtype)
-    _check_no_collisions(lines, dims, flat, n_flat, minimal)
-    dense[flat] = samples
-
-    return dense.reshape(*sizes, *samples.shape[1:])
 
 
 class Measurement:
@@ -1791,7 +1746,7 @@ class Measurement:
         lines : LineTable, optional
             The lines to fold; the imaging lines of the measurement by default.
         dims : tuple of str or str, optional
-            The counter names to use as grid axes, as for `to_dense`.
+            The counter names to use as grid axes, as for `minimal_dims`.
         reflect : bool, default True
             Un-reverse the lines flagged REFLECT.
 
@@ -1894,7 +1849,7 @@ class TwixFile:
     def __enter__(self) -> TwixFile:
         return self
 
-    def __exit__(self, *exc) -> None:
+    def __exit__(self, *_) -> None:
         self.close()
 
     @property

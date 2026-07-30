@@ -98,9 +98,6 @@ with tw.open_twix("meas.dat") as f:
 
 ```python
 dense = f.to_dense(dims=("Lin", "Par"))  # (Lin, Par, Cha, Col)
-
-lines = f.lines.image  # or, with the read in your hands
-dense = tw.to_dense(f.read(lines), lines, ("Lin", "Par"))
 ```
 
 `to_dense` raises if several lines land on the same grid position — that normally means a

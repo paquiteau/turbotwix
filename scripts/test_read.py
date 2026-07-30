@@ -3,6 +3,7 @@
 import logging
 import sys
 import time
+import pprint
 
 from turbotwix import open_twix
 
@@ -16,12 +17,10 @@ if __name__ == "__main__":
     tic = time.perf_counter()
     path = sys.argv[1]
     f = open_twix(path)
-    lines = f.lines  # one strided read of the line headers
-    lines.image  # LineTable: imaging lines only
-    lines.noise  # noise-calibration lines, for pre-whitening
-    len(lines.image), lines.shape  # 4800, (44, 15000)
 
-    samples = f.read(lines.image)  # (4800, 44, 15000) complex64
+    samples = f.to_dense()
     toc = time.perf_counter()
 
     print(f"Read {samples.shape} samples from {path} in {toc-tic:.2f} seconds")
+
+    pprint.pprint(f.hdr["Phoenix"])

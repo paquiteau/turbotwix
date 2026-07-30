@@ -118,18 +118,16 @@ def test_selections_compose_and_stay_line_tables(epi_path):
 
 def test_to_dense_folds_onto_chosen_counters(gre_path):
     m = tw.open_twix(gre_path)[-1]
-    lines = m.lines.image
-    samples = m.read(lines)
-    dense = tw.to_dense(samples, lines, ("Lin",))
+    samples = m.read(m.lines.image)
+    dense = m.to_dense(dims=("Lin",))
     assert dense.shape == (160, 2, 320)
     np.testing.assert_array_equal(dense[5], samples[5])
-    np.testing.assert_array_equal(m.to_dense(dims=("Lin",)), dense)
 
 
 def test_minimal_dims_keeps_genuinely_independent_counters():
     # Ave and Seg each take both values and neither determines the other, so nothing may
     # be dropped — the grid stays 2x2 for 3 lines.
-    mm, table, expected = build([(4, 2, 100 * k, 0) for k in range(3)])
+    mm, table, _ = build([(4, 2, 100 * k, 0) for k in range(3)])
     table["counters"]["Lin"] = 40
     table["counters"]["Seg"] = [1, 0, 1]
     table["counters"]["Ave"] = [0, 0, 1]
@@ -137,7 +135,10 @@ def test_minimal_dims_keeps_genuinely_independent_counters():
 
     assert tw._varying_counters(lines) == ("Ave", "Seg")
     assert tw.minimal_dims(lines) == ("Ave", "Seg")
-    assert tw.to_dense(np.stack(expected), lines, "minimal").shape == (2, 2, 2, 4)
+    dims, flat, sizes, minimal = tw._fold_index(lines, "minimal")
+    assert minimal
+    assert tuple(sizes) == (2, 2)
+    tw._check_no_collisions(lines, dims, flat, int(np.prod(sizes)), minimal)  # no raise
 
 
 # --- the object model on real files ---------------------------------------

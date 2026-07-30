@@ -57,7 +57,6 @@ def test_parity_pymapvbvd_dense_image(gre_path):
     ref = np.squeeze(ref_scan.image[tuple([slice(None)] * 16)])  # (Col, Cha, Lin)
 
     m = tw.open_twix(gre_path)[-1]
-    lines = m.lines.image
-    got = tw.to_dense(m.read(lines), lines, ("Lin",))  # (Lin, Cha, Col)
+    got = m.to_dense(dims=("Lin",))  # (Lin, Cha, Col)
 
     np.testing.assert_array_equal(got.transpose(2, 1, 0), ref)
