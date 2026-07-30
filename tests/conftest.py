@@ -3,13 +3,9 @@ import pathlib
 import numpy as np
 import pytest
 
-from turbotwix import _format, _read
+import turbotwix as tw
 
 DATA_DIR = pathlib.Path(__file__).parent / "data"
-
-# The two bundled samples, for reference: both VD, single measurement.
-GRE = {"lines": 161, "image": 160, "shape": (2, 320)}
-EPI = {"lines": 84, "image": 80, "phasecor": 3, "shape": (2, 160)}
 
 
 @pytest.fixture
@@ -22,32 +18,60 @@ def epi_path() -> str:
     return str(DATA_DIR / "epi.dat")
 
 
-def make_line(ncol: int, ncha: int, base: float, eval_mask: int = 0) -> tuple[bytes, np.ndarray]:
-    """One synthetic VD line whose samples carry recognisable values."""
-    h = np.zeros(1, dtype=_format.VD_SCAN_HEADER)[0]
-    h["SamplesInScan"] = ncol
-    h["UsedChannels"] = ncha
-    h["EvalInfoMask"] = eval_mask
-    buf = h.tobytes()
-    data = np.zeros((ncha, ncol), dtype="<c8")
+def line(
+    ncol: int, ncha: int, flags: int = 0, counter: int = 1, lin: int = 0, base: float | None = None
+) -> tuple[bytes, np.ndarray]:
+    """One synthetic VD line; its samples carry recognisable values if `base` is given."""
+    header = np.zeros(1, dtype=tw.VD_SCAN_HEADER)[0]
+    header["SamplesInScan"] = ncol
+    header["UsedChannels"] = ncha
+    header["EvalInfoMask"] = flags
+    header["ScanCounter"] = counter
+    header["Counter"]["Lin"] = lin
+
+    raw = header.tobytes()
+    samples = np.zeros((ncha, ncol), dtype="<c8")
     for c in range(ncha):
-        data[c] = np.arange(ncol) + base + 1000 * c
-        buf += np.zeros(1, dtype=_format.VD_CHANNEL_HEADER)[0].tobytes() + data[c].tobytes()
-    return buf, data
+        if base is not None:
+            samples[c] = np.arange(ncol) + base + 1000 * c
+        raw += np.zeros(1, dtype=tw.VD_CHANNEL_HEADER)[0].tobytes() + samples[c].tobytes()
+    return raw, samples
+
+
+def acqend(counter: int = 1) -> bytes:
+    """The terminator block: a bare scan header carrying ACQEND, no samples."""
+    header = np.zeros(1, dtype=tw.VD_SCAN_HEADER)[0]
+    header["EvalInfoMask"] = int(tw.Flag.ACQEND)
+    header["ScanCounter"] = counter
+    return header.tobytes()
+
+
+def sync(length: int, counter: int = 1) -> bytes:
+    """A shape-less PMU/sideband block, whose length lives in the raw DMA field."""
+    header = np.zeros(1, dtype=tw.VD_SCAN_HEADER)[0]
+    header["EvalInfoMask"] = int(tw.Flag.SYNCDATA)
+    header["FlagsAndDMALength"] = length
+    header["ScanCounter"] = counter
+    return header.tobytes() + bytes(length - tw.VD_SCAN_HEADER.itemsize)
+
+
+def table_of(raw: bytes) -> tuple[np.ndarray, np.ndarray, bool]:
+    """`(mm, table, truncated)` for a raw synthetic VD stream."""
+    mm = np.frombuffer(raw, dtype=np.uint8)
+    rows, truncated = tw.build_table(mm, 0, mm.size, tw.TwixVersion.VD)
+    return mm, rows, truncated
 
 
 def build(lines: list[tuple[int, int, float, int]]):
-    """`(mm, table, expected_samples)` for a synthetic stream of (ncol, ncha, base, flags)."""
+    """`(mm, table, expected)` for a stream of `(ncol, ncha, base, flags)` lines.
+
+    An ACQEND terminator is appended, so the result is a complete measurement in the only
+    layout turbotwix accepts.
+    """
     raw, expected = b"", []
-    for ncol, ncha, base, mask in lines:
-        buf, data = make_line(ncol, ncha, base, mask)
-        raw += buf
-        expected.append(data)
-    mm = np.frombuffer(raw, dtype=np.uint8)
-    table, _ = _read.walk_headers(mm, 0, mm.size, _format.TwixVersion.VD)
-    return mm, table, expected
-
-
-@pytest.fixture
-def build_lines():
-    return build
+    for k, (ncol, ncha, base, flags) in enumerate(lines):
+        chunk, samples = line(ncol, ncha, flags, counter=k + 1, lin=k, base=base)
+        raw += chunk
+        expected.append(samples)
+    mm, rows, _ = table_of(raw + acqend(len(lines) + 1))
+    return mm, rows, expected
