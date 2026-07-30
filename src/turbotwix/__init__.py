@@ -1033,37 +1033,63 @@ def _walk(
     pos = data_start
     truncated = False
 
-    while True:
-        if pos + hdr_size > scan_end:
-            truncated = True
-            break
-        header = mm[pos : pos + hdr_size].view(header_dtype)[0]
-        flags = header["EvalInfoMask"]
+    # Block count is small on this path (see the docstring), so the bar is cosmetic
+    # more often than not — but a spiral/radial file with many shots can still take
+    # long enough for feedback to matter, and tqdm is a no-op when not installed.
+    progress = (
+        tqdm(
+            total=scan_end - data_start,
+            unit="B",
+            unit_scale=True,
+            desc="turbotwix: walking blocks",
+            leave=False,
+        )
+        if tqdm is not None
+        else None
+    )
+    try:
+        while True:
+            if pos + hdr_size > scan_end:
+                truncated = True
+                break
+            header = mm[pos : pos + hdr_size].view(header_dtype)[0]
+            flags = header["EvalInfoMask"]
 
-        if flags & acqend_bit:
-            break
-        if flags & sync_bit:
-            # No (ncol, ncha)-derived shape, so the raw 25-bit length is all there is.
-            length = int(header["FlagsAndDMALength"]) & _DMA_LEN_MASK
+            if flags & acqend_bit:
+                break
+            if flags & sync_bit:
+                # No (ncol, ncha)-derived shape, so the raw 25-bit length is all
+                # there is.
+                length = int(header["FlagsAndDMALength"]) & _DMA_LEN_MASK
+                if length <= 0 or pos + length > scan_end:
+                    truncated = True
+                    break
+                pos += length
+                if progress is not None:
+                    progress.update(length)
+                continue
+
+            line_ncol, line_ncha = (
+                int(header["SamplesInScan"]),
+                int(header["UsedChannels"]),
+            )
+            if pos % 8:
+                raise UnsupportedLayoutError(
+                    f"line {len(rows)} starts at unaligned offset {pos}. "
+                    f"{_USE_A_REFERENCE_READER}"
+                )
+            length = prefix + line_ncha * (chan_hdr + 8 * line_ncol)
             if length <= 0 or pos + length > scan_end:
                 truncated = True
                 break
+
+            rows.append((pos, flags, line_ncol, line_ncha, header["Counter"]))
             pos += length
-            continue
-
-        line_ncol, line_ncha = int(header["SamplesInScan"]), int(header["UsedChannels"])
-        if pos % 8:
-            raise UnsupportedLayoutError(
-                f"line {len(rows)} starts at unaligned offset {pos}. "
-                f"{_USE_A_REFERENCE_READER}"
-            )
-        length = prefix + line_ncha * (chan_hdr + 8 * line_ncol)
-        if length <= 0 or pos + length > scan_end:
-            truncated = True
-            break
-
-        rows.append((pos, flags, line_ncol, line_ncha, header["Counter"]))
-        pos += length
+            if progress is not None:
+                progress.update(length)
+    finally:
+        if progress is not None:
+            progress.close()
 
     logger.debug("_walk: %d lines%s", len(rows), " (truncated)" if truncated else "")
     return np.array(rows, dtype=LINE_DTYPE), truncated
@@ -1156,6 +1182,7 @@ def read_lines(
     *,
     out: np.ndarray | None = None,
     reflect: bool = True,
+    dest: np.ndarray | None = None,
 ) -> np.ndarray:
     """Read every line in `table` into a `(len(table), ncha, ncol)` array.
 
@@ -1174,34 +1201,53 @@ def read_lines(
     version : TwixVersion
         The layout detected by `detect_version`.
     out : numpy.ndarray, optional
-        Preallocated `(len(table), ncha, ncol)` complex64 destination — a
-        `numpy.memmap`, a slice of a bigger array. Allocated if not given.
+        Preallocated destination — a `numpy.memmap`, a slice of a bigger array.
+        `(len(table), ncha, ncol)` complex64 when `dest` is not given (allocated if not
+        given either); `(*, ncha, ncol)` complex64, required, when `dest` is given.
     reflect : bool, default True
         Un-reverse the lines flagged REFLECT (bipolar readouts store them backwards).
         Pass False for the samples exactly as laid down on disk.
+    dest : numpy.ndarray, optional
+        Row index into `out` for each line of `table`, in order — e.g. `to_dense`'s
+        grid position — so a line is written straight to where it belongs instead of to
+        a compact `(len(table), ...)` buffer that then has to be copied again to fold
+        onto a grid. Requires `out`. Defaults to file order (row `i` for line `i`).
 
     Returns
     -------
     numpy.ndarray
-        The `(len(table), ncha, ncol)` complex64 samples; `out` itself when given.
+        The samples; `out` itself when given.
 
     Raises
     ------
     ValueError
-        If `out` does not have the required shape and dtype.
+        If `out` does not have the required shape and dtype, or if `dest` is given
+        without `out`.
     UnsupportedLayoutError
         If `table` mixes `(ncha, ncol)`: the result would not be rectangular.
     """
     n = len(table)
     ncha, ncol = common_shape(table)
-    shape = (n, ncha, ncol)
-    if out is None:
-        out = np.empty(shape, dtype=np.complex64)
-    elif out.shape != shape or out.dtype != np.complex64:
-        raise ValueError(f"out must be {shape} complex64, got {out.shape} {out.dtype}")
+    if dest is None:
+        shape = (n, ncha, ncol)
+        if out is None:
+            out = np.empty(shape, dtype=np.complex64)
+        elif out.shape != shape or out.dtype != np.complex64:
+            raise ValueError(
+                f"out must be {shape} complex64, got {out.shape} {out.dtype}"
+            )
+    else:
+        if out is None:
+            raise ValueError("out is required when dest is given")
+        if out.dtype != np.complex64 or out.shape[1:] != (ncha, ncol):
+            raise ValueError(
+                f"out must be (*, {ncha}, {ncol}) complex64, "
+                f"got {out.shape} {out.dtype}"
+            )
     if n == 0:
         return out
 
+    logger.debug("read_lines: %d lines, (%d, %d) samples each", n, ncha, ncol)
     prefix, chan_hdr = HEADER_SIZES[version]
     block = chan_hdr + 8 * ncol  # one channel: its header, then its samples
     # Index in complex64 units, not bytes: `build_table` has verified that every offset
@@ -1213,13 +1259,18 @@ def read_lines(
     # index traffic as data traffic — where a strided view is a plain memcpy. Evenly
     # spaced lines (the norm, since a measurement is usually one uniform run) are a
     # single view for the whole selection; an irregular selection is one view per line,
-    # each still at a fixed within-line stride.
+    # each still at a fixed within-line stride. Scattering to `dest` instead of writing
+    # row `i` is just a different assignment target — numpy's fancy-index assignment
+    # handles it in one vectorized call, same as the sequential case.
     step = int(starts[1] - starts[0]) if n > 1 else 0
     if step > 0 and np.all(np.diff(starts) == step):
         view = as_strided(
-            c8[int(starts[0]) :], shape=shape, strides=(8 * step, block, 8)
+            c8[int(starts[0]) :], shape=(n, ncha, ncol), strides=(8 * step, block, 8)
         )
-        np.copyto(out, view)
+        if dest is None:
+            np.copyto(out, view)
+        else:
+            out[dest] = view
     else:
         logger.debug("read_lines: %d irregularly-spaced lines, reading one by one", n)
         iterator = enumerate(starts)
@@ -1239,6 +1290,8 @@ def read_lines(
 
     if reflect:
         idx = np.flatnonzero(has_flag(table["flags"], Flag.REFLECT))
+        if dest is not None:
+            idx = dest[idx]
         chunk = max(1, _FLIP_BUDGET_BYTES // max(8 * ncha * ncol, 1))
         for at in range(0, idx.size, chunk):
             picked = idx[at : at + chunk]
@@ -1516,6 +1569,67 @@ def minimal_dims(lines: LineTable) -> tuple[str, ...]:
     return tuple(dims)
 
 
+def _fold_index(
+    lines: LineTable, dims: tuple[str, ...] | str
+) -> tuple[tuple[str, ...], np.ndarray, list[int], bool]:
+    """Each line's flat grid position for `to_dense`, computed from counters alone.
+
+    Metadata-scale (one int per line), so it is cheap to compute before any sample data
+    is read — which is what lets `Measurement.to_dense` write each line straight to its
+    grid cell instead of into a compact buffer that then has to be folded separately.
+
+    Parameters
+    ----------
+    lines : LineTable
+        The lines to place on a grid.
+    dims : tuple of str or {'minimal'}
+        The counter names to use as grid axes, as for `to_dense`.
+
+    Returns
+    -------
+    dims : tuple of str
+        The dims actually used (`minimal_dims(lines)` when `dims` was ``"minimal"``).
+    flat : numpy.ndarray
+        The `(len(lines),)` flat grid index of each line.
+    sizes : list of int
+        The size of each axis in `dims`.
+    minimal : bool
+        Whether `dims` came from `minimal_dims` (grid is known to be collision-free).
+    """
+    minimal = False
+    if dims == "minimal":
+        dims = minimal_dims(lines)
+        minimal = True
+
+    idx = [lines.counter(name) for name in dims]
+    # shift the grid so the acquired range starts at 0.
+    idx = [values - int(values.min()) for values in idx]
+    sizes = [int(values.max()) + 1 for values in idx]
+    flat = np.ravel_multi_index(tuple(idx), sizes)
+    return dims, flat, sizes, minimal
+
+
+def _check_no_collisions(
+    lines: LineTable,
+    dims: tuple[str, ...],
+    flat: np.ndarray,
+    n_flat: int,
+    minimal: bool,
+) -> None:
+    """Raise if two lines land on one grid cell under explicit (non-minimal) dims."""
+    counts = np.bincount(flat, minlength=n_flat)
+    if counts.max(initial=0) > 1 and not minimal:
+        varying = [
+            name
+            for name in COUNTERS
+            if name not in dims and len(np.unique(lines.counter(name))) > 1
+        ]
+        raise ValueError(
+            f"{int((counts > 1).sum())} grid positions receive more than one line. "
+            + (f"Counters varying but not in dims: {varying}.")
+        )
+
+
 def to_dense(
     samples: np.ndarray,
     lines: LineTable,
@@ -1548,34 +1662,12 @@ def to_dense(
     """
     if len(samples) != len(lines):
         raise ValueError(f"samples has {len(samples)} lines, table has {len(lines)}")
-    minimal = False
-    if dims == "minimal":
-        dims = minimal_dims(lines)
-        minimal = True
-
-    idx = [lines.counter(name) for name in dims]
-    # shift the grid so the acquired range starts at 0.
-    idx = [values - int(values.min()) for values in idx]
-    sizes = [int(values.max()) + 1 for values in idx]
-    flat = np.ravel_multi_index(tuple(idx), sizes)
+    dims, flat, sizes, minimal = _fold_index(lines, dims)
 
     n_flat = int(np.prod(sizes))
     dense = np.zeros((n_flat, *samples.shape[1:]), dtype=samples.dtype)
-    counts = np.bincount(flat, minlength=n_flat)
-
-    if counts.max(initial=0) > 1 and not minimal:
-        # probably going to delete all of this
-        varying = [
-            name
-            for name in COUNTERS
-            if name not in dims and len(np.unique(lines.counter(name))) > 1
-        ]
-        raise ValueError(
-            f"{int((counts > 1).sum())} grid positions receive more than one line. "
-            + (f"Counters varying but not in dims: {varying}.")
-        )
-    else:
-        dense[flat] = samples
+    _check_no_collisions(lines, dims, flat, n_flat, minimal)
+    dense[flat] = samples
 
     return dense.reshape(*sizes, *samples.shape[1:])
 
@@ -1689,6 +1781,11 @@ class Measurement:
     ) -> np.ndarray:
         """Read the k-space data and return a dense array of it.
 
+        Reads each line straight into its grid cell rather than into a compact
+        `(n, ncha, ncol)` buffer that is then folded separately — one full-size
+        allocation instead of two, since the grid position of every line
+        (`_fold_index`) needs only its counters, not its sample data.
+
         Parameters
         ----------
         lines : LineTable, optional
@@ -1704,8 +1801,21 @@ class Measurement:
             An array shaped `(*dim_sizes, ncha, ncol)`.
         """
         table = self.lines.image if lines is None else lines
-        samples = self.read(table, reflect=reflect)
-        return to_dense(samples, table, dims)
+        ncha, ncol = table.shape
+        dims, flat, sizes, minimal = _fold_index(table, dims)
+        n_flat = int(np.prod(sizes))
+        _check_no_collisions(table, dims, flat, n_flat, minimal)
+
+        dense = np.zeros((n_flat, ncha, ncol), dtype=np.complex64)
+        read_lines(
+            self._file.mm,
+            table.rows,
+            self._file.version,
+            out=dense,
+            dest=flat,
+            reflect=reflect,
+        )
+        return dense.reshape(*sizes, ncha, ncol)
 
 
 class TwixFile:
