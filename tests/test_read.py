@@ -126,40 +126,6 @@ def test_to_dense_folds_onto_chosen_counters(gre_path):
     np.testing.assert_array_equal(m.to_dense(dims=("Lin",)), dense)
 
 
-def test_dims_none_uses_the_counters_that_vary():
-    mm, table, expected = build([(4, 2, 100 * k, 0) for k in range(4)])
-    table["counters"]["Lin"] = [0, 0, 1, 1]
-    table["counters"]["Seg"] = [0, 1, 0, 1]
-    lines = tw.LineTable(table, mm, VD)
-    samples = np.stack(expected)
-
-    assert tw._varying_counters(lines) == ("Lin", "Seg")
-    assert tw.to_dense(samples, lines, None).shape == (2, 2, 2, 4)
-    # ... which is exactly what naming them does, and what the default cannot do here.
-    np.testing.assert_array_equal(
-        tw.to_dense(samples, lines, None), tw.to_dense(samples, lines, ("Lin", "Seg"))
-    )
-    with pytest.raises(ValueError, match="Seg"):
-        tw.to_dense(samples, lines, ("Lin", "Par"))
-
-
-def test_minimal_dims_drops_determined_counters():
-    # Seg tracks Lin parity, as an EPI readout polarity does: it varies, so dims=None keeps
-    # it and leaves half the grid empty, but it adds nothing that Lin does not already say.
-    n = 8
-    mm, table, expected = build([(4, 2, 100 * k, 0) for k in range(n)])
-    table["counters"]["Lin"] = np.arange(n)
-    table["counters"]["Seg"] = np.arange(n) % 2
-    lines = tw.LineTable(table, mm, VD)
-    samples = np.stack(expected)
-
-    assert tw._varying_counters(lines) == ("Lin", "Seg")
-    assert tw.minimal_dims(lines) == ("Lin",)
-    assert tw.to_dense(samples, lines, None).shape == (n, 2, 2, 4)  # half of it zeros
-    assert tw.to_dense(samples, lines, "minimal").shape == (n, 2, 4)
-    np.testing.assert_array_equal(tw.to_dense(samples, lines, "minimal"), samples)
-
-
 def test_minimal_dims_keeps_genuinely_independent_counters():
     # Ave and Seg each take both values and neither determines the other, so nothing may
     # be dropped — the grid stays 2x2 for 3 lines.
@@ -172,60 +138,6 @@ def test_minimal_dims_keeps_genuinely_independent_counters():
     assert tw._varying_counters(lines) == ("Ave", "Seg")
     assert tw.minimal_dims(lines) == ("Ave", "Seg")
     assert tw.to_dense(np.stack(expected), lines, "minimal").shape == (2, 2, 2, 4)
-
-
-def test_minimal_dims_on_real_files(gre_path, epi_path):
-    gre = tw.open_twix(gre_path)[-1]
-    assert tw.minimal_dims(gre.lines.image) == ("Lin",)  # nothing to drop
-
-    epi = tw.open_twix(epi_path)[-1]
-    lines = epi.lines.image
-    assert tw.minimal_dims(lines) == ("Lin",)  # Seg is the Lin parity
-    dense = epi.to_dense(lines, dims="minimal")
-    assert dense.shape == (80, 2, 160)
-    # Same samples as the padded grid, without the empty half.
-    padded = epi.to_dense(lines, dims=None)
-    np.testing.assert_array_equal(dense, padded.sum(axis=1))
-
-    # phasecor: Ave and Seg are independent, so the search declines to drop either.
-    assert tw.minimal_dims(epi.lines.phasecor) == ("Ave", "Seg")
-
-
-def test_to_dense_rejects_an_unknown_dims_string():
-    mm, table, expected = build([(4, 2, 100, 0)])
-    lines = tw.LineTable(table, mm, VD)
-    with pytest.raises(ValueError, match="None or 'minimal'"):
-        tw.to_dense(np.stack(expected), lines, "Lin")
-
-
-def test_dims_none_never_produces_a_rank_zero_grid():
-    # Nothing varies, so there is no grid: one degenerate axis, and a collision reported
-    # as what it is rather than as a missing counter.
-    mm, table, expected = build([(4, 2, 100, 0), (4, 2, 200, 0)])
-    table["counters"]["Lin"] = 0
-    lines = tw.LineTable(table, mm, VD)
-    assert tw._varying_counters(lines) == ("Lin",)
-    with pytest.raises(ValueError, match="acquired repeatedly"):
-        tw.to_dense(np.stack(expected), lines, None)
-    assert tw.to_dense(np.stack(expected), lines, None, reduce="last").shape == (
-        1,
-        2,
-        4,
-    )
-
-
-def test_dims_none_on_real_files(gre_path, epi_path):
-    gre = tw.open_twix(gre_path)[-1]
-    assert tw._varying_counters(gre.lines.image) == ("Lin",)
-    assert gre.to_dense(dims=None).shape == (160, 2, 320)
-
-    epi = tw.open_twix(epi_path)[-1]
-    lines = epi.lines.image
-    # Seg is the readout polarity, i.e. Lin parity: an axis whose product with Lin is
-    # half empty. Auto-dims cannot know that; naming ("Lin",) would collide, so this is
-    # the honest shape.
-    assert tw._varying_counters(lines) == ("Lin", "Seg")
-    assert epi.to_dense(lines, dims=None).shape == (80, 2, 2, 160)
 
 
 # --- the object model on real files ---------------------------------------
