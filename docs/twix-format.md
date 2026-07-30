@@ -321,10 +321,11 @@ back to the walk — if any of these fails:
 Both bundled sample files satisfy all of them (single stride, `ScanCounter` `1..N` dense,
 exactly `sizeof(ACQEND)` bytes left over), so their tables are built in under 0.1 ms.
 
-Two things *are* required rather than hypothesized, and raise `UnsupportedLayoutError`
-with a message pointing at pymapvbvd or twixtools: all ADC lines in a measurement must
-share one `(ncha, ncol)`, and their offsets must be 8-byte aligned (which is what lets
-extraction view the file as one `complex64` array and copy with strides).
+One thing *is* required rather than hypothesized, and raises `UnsupportedLayoutError` with
+a message pointing at pymapvbvd or twixtools: ADC line offsets must be 8-byte aligned,
+which is what lets extraction view the file as one `complex64` array and copy with
+strides. A measurement mixing `(ncha, ncol)` is tabled normally — only a read, whose
+result is one rectangular array, needs a single-shaped selection.
 
 The `ScanCounter` check is the one that does not correspond to anything the walk tests.
 A walk gets its correctness from never guessing a stride; the fast path guesses once, so

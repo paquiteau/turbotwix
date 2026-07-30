@@ -71,16 +71,35 @@ def test_walk_handles_several_runs_of_one_shape():
 
 
 @pytest.mark.parametrize("interrupted", [False, True])
-def test_a_change_of_shape_is_refused(interrupted):
-    # Both paths refuse it: reaching the walk (a sync block breaks the run) does not make
-    # mixed shapes readable. One measurement, one shape, or an error.
+def test_a_change_of_shape_is_tabled_and_refused_only_at_read(interrupted):
+    # A measurement with an embedded reference scan changes shape mid-stream. The table
+    # keeps every line, with its own shape; only a read, which must be rectangular,
+    # insists on one shape.
     raw = lines(3)
     if interrupted:
         raw += sync(256, 4)
     raw += line(6, 1, counter=5)[0] + acqend(6)
 
-    with pytest.raises(tw.UnsupportedLayoutError, match="one shape per measurement"):
-        table_of(raw)
+    mm, table, truncated = table_of(raw)
+    assert not truncated
+    assert table["ncol"].tolist() == [4, 4, 4, 6]
+    assert table["ncha"].tolist() == [2, 2, 2, 1]
+
+    with pytest.raises(tw.UnsupportedLayoutError, match="mix shapes"):
+        tw.read_lines(mm, table, tw.TwixVersion.VD)
+
+    # Either single-shaped subset reads on its own.
+    assert tw.read_lines(mm, table[:3], tw.TwixVersion.VD).shape == (3, 2, 4)
+    assert tw.read_lines(mm, table[3:], tw.TwixVersion.VD).shape == (1, 1, 6)
+
+
+def test_a_mixed_line_table_reports_its_shapes():
+    mm, table, _ = table_of(lines(3) + line(6, 1, counter=4)[0] + acqend(5))
+    mixed = tw.LineTable(table, mm, tw.TwixVersion.VD)
+    assert repr(mixed) == "LineTable(4 lines, mixed shapes [(1, 6), (2, 4)])"
+    with pytest.raises(tw.UnsupportedLayoutError, match="mix shapes"):
+        mixed.shape
+    assert mixed[:3].shape == (2, 4)
 
 
 def test_unaligned_data_start_is_refused():

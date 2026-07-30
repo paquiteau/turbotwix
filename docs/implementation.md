@@ -7,23 +7,24 @@ Everything lives in `src/turbotwix/__init__.py`, in the order a file is read: bi
 layout, the eval-info mask, the text protocol, the line table, sample extraction, the
 object model.
 
-## The two invariants
+## The invariant, and the one requirement that is not one
 
-Two things are required rather than guessed, and a measurement that breaks either raises
-`UnsupportedLayoutError`:
+**8-byte-aligned line offsets** are required rather than guessed, and a measurement that
+breaks it raises `UnsupportedLayoutError`: every sample offset is
+`line_offset + prefix + (c+1)*chan_hdr + c*8*ncol`, and every term but the line offset is
+a multiple of 8. Keeping line offsets aligned is what lets extraction view the whole
+mapped file as one `complex64` array and address samples in complex units — a fixed stride
+within a line, no per-line bookkeeping.
 
-1. **One `(ncha, ncol)` per measurement.** Blocks that carry no samples (ACQEND,
-   PMU/SYNCDATA) are stepped over rather than recorded, which is what keeps every table
-   single-shaped For instance, A measurement that genuinely mixes shapes — a coil-sensitivity
-   adjustment storing body-coil (`ncha=2`) and array-coil (`ncha=44`) images together — has
-   no single answer here; use pymapvbvd or twixtools for those.
-2. **8-byte-aligned line offsets.** Every sample offset is
-   `line_offset + prefix + (c+1)*chan_hdr + c*8*ncol`, and every term but the line offset
-   is a multiple of 8. Keeping line offsets aligned is what lets extraction view the whole
-   mapped file as one `complex64` array and address samples in complex units.
-
-Together they turn both selection and extraction into arithmetic: a fixed row size in the
-table, a fixed stride within a line, and no per-line bookkeeping.
+**One `(ncha, ncol)`** is *not* required of a measurement, only of a read. Mixed shapes are
+common and legitimate: an embedded parallel-imaging reference scan is Cartesian and short
+where the imaging lines are spiral and long, and a coil-sensitivity adjustment stores
+body-coil (`ncha=2`) and array-coil (`ncha=44`) lines together. Refusing the file over that
+would refuse data that is perfectly readable line by line, so `LINE_DTYPE` carries each
+line's own shape and the table stays whole. `read_lines` is where the requirement actually
+bites, because its result is one `(n_lines, ncha, ncol)` array; it calls `common_shape`,
+which raises `UnsupportedLayoutError` naming the shapes present. A selection
+(`.image`, `.refscan`, `.noise`) is the fix, and is what the caller wanted anyway.
 
 ## 1. One mmap
 

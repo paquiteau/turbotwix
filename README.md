@@ -17,11 +17,14 @@ anyway costs memory proportional to the *nominal* matrix rather than the acquire
 forces a policy on duplicate indices, and makes partial reads impossible. Folding onto a
 grid is available when you want it (`to_dense`), never implicit.
 
-Every ADC line in a measurement must report the same `(ncha, ncol)`, and line offsets must
-be 8-byte aligned; blocks that carry no samples (ACQEND, PMU/SYNCDATA) are skipped rather
-than returned. A measurement that genuinely mixes shapes — a coil-sensitivity adjustment
-storing body-coil (`ncha=2`) and array-coil (`ncha=44`) images together — raises
-`UnsupportedLayoutError`; use pymapvbvd or twixtools for those.
+Line offsets must be 8-byte aligned; blocks that carry no samples (ACQEND, PMU/SYNCDATA)
+are skipped rather than returned. A measurement may mix `(ncha, ncol)` — an embedded
+parallel-imaging reference scan is short and Cartesian where the imaging lines are long,
+and a coil-sensitivity adjustment stores body-coil (`ncha=2`) and array-coil (`ncha=44`)
+lines together — and the table holds those lines all the same. Only a *read* needs one
+shape, since its result is one `(n_lines, ncha, ncol)` array, so reading such a
+measurement means selecting first (`lines.image`, `lines.refscan`); asking for the mixed
+set raises `UnsupportedLayoutError`.
 
 ## Usage
 
@@ -127,8 +130,9 @@ The numbers, the methodology and where the speed comes from are in
 
 ## Known limitations
 
-- A measurement whose ADC lines change `(ncha, ncol)` raises `UnsupportedLayoutError`;
-  so does one whose line offsets are not 8-byte aligned.
+- A measurement whose line offsets are not 8-byte aligned raises `UnsupportedLayoutError`.
+- Lines of differing `(ncha, ncol)` are tabled together but cannot be read in one call;
+  select a single-shaped subset.
 - PMU/SYNCDATA blocks are skipped, not decoded, so they do not appear in the line table.
 - No ramp-sampling regridding or slice-geometry parsing.
 - No oversampling removal: it is signal processing (an FFT round-trip), and along a

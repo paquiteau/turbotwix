@@ -62,11 +62,14 @@ class TruncatedFileError(TwixParseError):
 class UnsupportedLayoutError(TwixParseError):
     """Raised when a measurement is not laid out the way turbotwix requires.
 
-    Two things are required rather than guessed: all ADC lines of a measurement share
-    one `(ncha, ncol)`, and their offsets are 8-byte aligned (which is what lets
-    extraction view the file as one `complex64` array and copy by strides). A
-    coil-sensitivity adjustment storing body-coil and array-coil images together breaks
-    the first; use pymapvbvd or twixtools for those.
+    One thing is required rather than guessed: ADC line offsets are 8-byte aligned,
+    which is what lets extraction view the file as one `complex64` array and copy by
+    strides. Use pymapvbvd or twixtools for a file that breaks it.
+
+    Also raised when a *read* is asked for lines of differing `(ncha, ncol)` — an
+    embedded reference scan, or a coil-sensitivity adjustment holding body-coil and
+    array-coil lines. That is not a limit on the file, only on one rectangular result:
+    the table holds those lines, and selecting a single-shaped subset reads them.
     """
 
 
@@ -75,7 +78,7 @@ class UnsupportedVersionError(TwixParseError):
 
 
 _USE_A_REFERENCE_READER = (
-    "turbotwix reads one (ncha, ncol) per measurement, at 8-byte-aligned offsets. "
+    "turbotwix reads lines at 8-byte-aligned offsets. "
     "Use pymapvbvd or twixtools for this file."
 )
 
@@ -809,8 +812,14 @@ def build_table(
     """Build the line table of one measurement.
 
     Blocks that hold no samples (ACQEND, SYNCDATA/PMU) are stepped over, not recorded:
-    nothing here can decode them, and leaving them out is what keeps every table
-    single-shaped.
+    nothing here can decode them.
+
+    A measurement may mix `(ncha, ncol)` — an embedded parallel-imaging reference scan
+    is Cartesian and short where the imaging lines are spiral and long, and a
+    coil-sensitivity adjustment stores body-coil and array-coil lines together. The
+    table records each line's own shape and stays whole; the one-shape rule belongs to
+    `read_lines`, which needs a rectangular result, and is met by selecting (`.image`,
+    `.refscan`) before reading.
 
     The stream carries no index and no line count — each line's length is computed from
     its own header — so this looks inherently sequential. Two regimes, each with its own
@@ -850,8 +859,7 @@ def build_table(
     Raises
     ------
     UnsupportedLayoutError
-        If `data_start` or any line offset is not 8-byte aligned, or if the lines do not
-        all share one ``(ncha, ncol)``.
+        If `data_start` or any line offset is not 8-byte aligned.
     """
     if data_start % 8:
         # Every sample offset is `line_offset + prefix + (c+1)*chan_hdr + c*8*ncol`, and
@@ -996,8 +1004,7 @@ def _walk(
     Raises
     ------
     UnsupportedLayoutError
-        If a line's shape differs from the first line's, or if a line starts at an
-        offset that is not 8-byte aligned.
+        If a line starts at an offset that is not 8-byte aligned.
     """
     hdr_size = header_dtype.itemsize
     prefix, chan_hdr = HEADER_SIZES[version]
@@ -1005,7 +1012,6 @@ def _walk(
     sync_bit = np.uint64(Flag.SYNCDATA)
 
     rows: list[tuple] = []
-    ncol = ncha = -1
     pos = data_start
     truncated = False
 
@@ -1028,15 +1034,6 @@ def _walk(
             continue
 
         line_ncol, line_ncha = int(header["SamplesInScan"]), int(header["UsedChannels"])
-        if ncol < 0:  # first line: record its shape for the rest of the measurement
-            ncol, ncha = line_ncol, line_ncha
-        elif (line_ncol, line_ncha) != (ncol, ncha):
-            raise UnsupportedLayoutError(
-                f"line {len(rows)} has shape (ncha={line_ncha}, ncol={line_ncol}) "
-                f"instead of ({ncha}, {ncol}); turbotwix reads one shape per "
-                f"measurement. "
-                f"{_USE_A_REFERENCE_READER}"
-            )
         if pos % 8:
             raise UnsupportedLayoutError(
                 f"line {len(rows)} starts at unaligned offset {pos}. "
@@ -1051,6 +1048,46 @@ def _walk(
         pos += length
 
     return np.array(rows, dtype=LINE_DTYPE), truncated
+
+
+def common_shape(table: np.ndarray) -> tuple[int, int]:
+    """The one `(ncha, ncol)` of every line in `table`.
+
+    Parameters
+    ----------
+    table : numpy.ndarray
+        A `LINE_DTYPE` array, as in `LineTable.rows`.
+
+    Returns
+    -------
+    tuple of (int, int)
+        The common `(ncha, ncol)`; `(0, 0)` for an empty table.
+
+    Raises
+    ------
+    UnsupportedLayoutError
+        If the lines do not all share one shape. Select a single-shaped subset first —
+        `.image`, `.refscan`, `.noise` usually separate them.
+    """
+    if len(table) == 0:
+        return (0, 0)
+    ncha, ncol = int(table["ncha"][0]), int(table["ncol"][0])
+    if len(table) == 1:
+        return (ncha, ncol)
+    shapes, counts = np.unique(
+        np.stack([table["ncha"], table["ncol"]], axis=1), axis=0, return_counts=True
+    )
+    if len(shapes) > 1:
+        listed = ", ".join(
+            f"(ncha={int(a)}, ncol={int(c)}) on {int(n)} lines"
+            for (a, c), n in zip(shapes, counts)
+        )
+        raise UnsupportedLayoutError(
+            f"these lines mix shapes: {listed}. A read returns one "
+            f"(n_lines, ncha, ncol) array, so select a single-shaped subset first — "
+            f"e.g. .image, .refscan or .noise."
+        )
+    return (ncha, ncol)
 
 
 def read_headers(
@@ -1133,9 +1170,11 @@ def read_lines(
     ------
     ValueError
         If `out` does not have the required shape and dtype.
+    UnsupportedLayoutError
+        If `table` mixes `(ncha, ncol)`: the result would not be rectangular.
     """
     n = len(table)
-    ncha, ncol = (int(table["ncha"][0]), int(table["ncol"][0])) if n else (0, 0)
+    ncha, ncol = common_shape(table)
     shape = (n, ncha, ncol)
     if out is None:
         out = np.empty(shape, dtype=np.complex64)
@@ -1230,7 +1269,16 @@ class LineTable:
     def __repr__(self) -> str:
         if len(self) == 0:
             return "LineTable(0 lines)"
-        return f"LineTable({len(self)} lines, shape={self.shape})"
+        try:
+            return f"LineTable({len(self)} lines, shape={self.shape})"
+        except UnsupportedLayoutError:
+            shapes = sorted(
+                {
+                    (int(a), int(c))
+                    for a, c in zip(self._rows["ncha"], self._rows["ncol"])
+                }
+            )
+            return f"LineTable({len(self)} lines, mixed shapes {shapes})"
 
     @property
     def rows(self) -> np.ndarray:
@@ -1269,10 +1317,15 @@ class LineTable:
 
     @property
     def shape(self) -> tuple[int, int]:
-        """The `(ncha, ncol)` shape of every line — one measurement, one shape."""
-        if len(self) == 0:
-            return (0, 0)
-        return (int(self._rows["ncha"][0]), int(self._rows["ncol"][0]))
+        """The `(ncha, ncol)` shape shared by these lines.
+
+        Raises
+        ------
+        UnsupportedLayoutError
+            If the selection mixes shapes, as a measurement with an embedded reference
+            scan does. Select a single-shaped subset (`.image`, `.refscan`, `.noise`).
+        """
+        return common_shape(self._rows)
 
     def headers(self) -> np.ndarray:
         """The full VB/VD scan headers of these lines, re-read from the file.
