@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import enum
 import functools
+import logging
 import mmap as _mmap
 import re
 import struct
@@ -32,6 +33,13 @@ from typing import Literal, NamedTuple
 
 import numpy as np
 from numpy.lib.stride_tricks import as_strided
+
+try:  # optional dependency, only used for the _walk progress bar
+    from tqdm import tqdm
+except ImportError:
+    tqdm: type | None = None  # type: ignore[no-redef]
+
+logger = logging.getLogger("turbotwix")
 
 __all__ = [
     "COUNTERS",
@@ -875,7 +883,16 @@ def build_table(
 
     uniform = _uniform_run(mm, data_start, scan_end, version, header_dtype)
     if uniform is not None:
+        table, truncated = uniform
+        logger.debug(
+            "build_table: uniform run, %d lines%s",
+            len(table),
+            " (truncated)" if truncated else "",
+        )
         return uniform
+    logger.debug(
+        "build_table: non-uniform layout, walking %d bytes", scan_end - data_start
+    )
     return _walk(mm, data_start, scan_end, version, header_dtype)
 
 
@@ -1047,6 +1064,7 @@ def _walk(
         rows.append((pos, flags, line_ncol, line_ncha, header["Counter"]))
         pos += length
 
+    logger.debug("_walk: %d lines%s", len(rows), " (truncated)" if truncated else "")
     return np.array(rows, dtype=LINE_DTYPE), truncated
 
 
@@ -1202,8 +1220,19 @@ def read_lines(
         )
         np.copyto(out, view)
     else:
-        for i, start in enumerate(starts):
-            out[i] = as_strided(
+        logger.debug("read_lines: %d irregularly-spaced lines, reading one by one", n)
+        iterator = enumerate(starts)
+        if tqdm is not None:
+            iterator = tqdm(
+                iterator,
+                total=n,
+                unit="line",
+                desc="turbotwix: reading lines",
+                leave=False,
+            )
+        for i, start in iterator:
+            row = i if dest is None else int(dest[i])
+            out[row] = as_strided(
                 c8[int(start) :], shape=(ncha, ncol), strides=(block, 8)
             )
 
@@ -1721,6 +1750,13 @@ class TwixFile:
         ]
         if not self.measurements:
             raise TwixParseError(f"{path}: no non-empty measurement")
+        logger.debug(
+            "%s: %s, %d measurement(s), %.1f MiB",
+            path,
+            self.version.name,
+            len(self.measurements),
+            self.mm.size / 2**20,
+        )
 
     @property
     def mm(self) -> np.ndarray:
