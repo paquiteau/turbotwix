@@ -152,12 +152,12 @@ to address the two readout polarities separately — which is why it is opt-in.
 
 ## Benchmark methodology
 
-`benchmarks/bench_read.py` times reading the image data of a `.dat` file with turbotwix,
+`scripts/bench_read.py` times reading the image data of a `.dat` file with turbotwix,
 pymapvbvd and twixtools, each in its own subprocess so peak RSS is measured in isolation.
 
 ```
 uv sync --group parity
-python benchmarks/bench_read.py YOUR_FILE.dat --libs turbotwix turbotwix-lines pymapvbvd twixtools
+python scripts/bench_read.py YOUR_FILE.dat --libs turbotwix pymapvbvd twixtools
 ```
 
 Measured on a 1 GB Cartesian file, page-cache-resident, so the numbers reflect CPU overhead

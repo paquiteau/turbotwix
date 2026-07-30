@@ -11,6 +11,9 @@ buffered `read()`s of the other two land in page cache without ever showing up i
 Anonymous RSS counts only memory the process actually has to own. Peak file-backed RSS
 is reported alongside as `mmap`, and raw `ru_maxrss` as `maxrss`.
 
+Each run evicts the file from the page cache first (`vmtouch -e`), so results
+reflect cold-cache reads rather than whatever a prior run left cached.
+
 Usage:
     python bench_read.py FILE.dat [--libs turbotwix pymapvbvd twixtools]
 """
@@ -89,7 +92,13 @@ print(json.dumps({{
 """
 
 
+def _evict_page_cache(path: str) -> None:
+    """Evict `path` from the page cache so each run starts from a cold cache."""
+    subprocess.run(["vmtouch", "-e", path], capture_output=True, text=True, check=True)
+
+
 def run_single(lib: str, path: str) -> dict:
+    _evict_page_cache(path)
     script = _SINGLE_SCRIPT.format(path=path, code=_READ_CODE[lib])
     result = subprocess.run(
         [sys.executable, "-c", script], capture_output=True, text=True, check=False

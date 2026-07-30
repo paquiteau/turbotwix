@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 
-import os
-import sys
 import logging
+import sys
 import time
 
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s")
-
 from turbotwix import open_twix
+
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s")
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
