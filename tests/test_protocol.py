@@ -21,7 +21,8 @@ def test_protocol_buffers_are_parsed_lazily(gre_path):
 
     assert prot.MeasYaps["alTR"] == [10000]
     assert isinstance(dict.__getitem__(prot, "MeasYaps"), tw.AttrDict)
-    assert isinstance(dict.__getitem__(prot, "Meas"), bytes)  # untouched buffers stay raw
+    # untouched buffers stay raw
+    assert isinstance(dict.__getitem__(prot, "Meas"), bytes)
 
 
 def test_protocol_bulk_access_parses_every_buffer(gre_path):

@@ -24,7 +24,9 @@ def test_parity_twixtools_per_line_samples(dataset, request):
     import twixtools
 
     path = request.getfixturevalue(dataset)
-    [scan] = twixtools.read_twix(path, include_scans=[-1], parse_geometry=False, verbose=False)
+    [scan] = twixtools.read_twix(
+        path, include_scans=[-1], parse_geometry=False, verbose=False
+    )
     ref = np.stack([mdb.data for mdb in scan["mdb"] if mdb.is_image_scan()])
 
     m = tw.open_twix(path)[-1]

@@ -19,7 +19,12 @@ def epi_path() -> str:
 
 
 def line(
-    ncol: int, ncha: int, flags: int = 0, counter: int = 1, lin: int = 0, base: float | None = None
+    ncol: int,
+    ncha: int,
+    flags: int = 0,
+    counter: int = 1,
+    lin: int = 0,
+    base: float | None = None,
 ) -> tuple[bytes, np.ndarray]:
     """One synthetic VD line; its samples carry recognisable values if `base` is given.
 
@@ -72,8 +77,8 @@ def table_of(raw: bytes) -> tuple[np.ndarray, np.ndarray, bool]:
 def build(lines: list[tuple[int, int, float, int]]):
     """`(mm, table, expected)` for a stream of `(ncol, ncha, base, flags)` lines.
 
-    An ACQEND terminator is appended, so the result is a complete measurement in the only
-    layout turbotwix accepts.
+    An ACQEND terminator is appended, so the result is a complete measurement in
+    the only layout turbotwix accepts.
     """
     raw, expected = b"", []
     for k, (ncol, ncha, base, flags) in enumerate(lines):

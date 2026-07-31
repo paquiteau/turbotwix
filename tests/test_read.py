@@ -1,4 +1,5 @@
-"""Sample extraction, line selection and the object model, on synthetic and real files."""
+"""Sample extraction, line selection, and the object model, on synthetic and real
+files."""
 
 import pathlib
 import struct
@@ -197,8 +198,8 @@ def test_headers_available_on_demand(gre_path):
 
 
 def _truncated_copy(src: str, dst: pathlib.Path) -> str:
-    """Copy `src` cut off just before its ACQEND line, rewriting the raid entry length to
-    0 so `parse_raid_directory` recomputes it from the new file size.
+    """Copy `src` cut off just before its ACQEND line, rewriting the raid entry
+    length to 0 so `parse_raid_directory` recomputes it from the new file size.
     """
     mm = tw.data.open_mmap(src)
     version = tw.dtypes.detect_version(mm)

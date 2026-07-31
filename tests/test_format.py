@@ -68,7 +68,9 @@ def test_detect_version_rejects_non_twix_files():
         tw.dtypes.detect_version(np.zeros(4, dtype=np.uint8))
 
     # Not VD (second u32 > MAX_RAID_ENTRIES) and an implausible VB header length.
-    garbage = np.frombuffer(struct.pack("<II", 0xDEADBEEF, 0xFFFF) + bytes(64), dtype=np.uint8)
+    garbage = np.frombuffer(
+        struct.pack("<II", 0xDEADBEEF, 0xFFFF) + bytes(64), dtype=np.uint8
+    )
     with pytest.raises(tw.UnsupportedVersionError):
         tw.dtypes.detect_version(garbage)
 

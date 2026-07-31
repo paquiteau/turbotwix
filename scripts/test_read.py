@@ -23,4 +23,4 @@ if __name__ == "__main__":
     samples = f.read(dims="minimal")
     toc = time.perf_counter()
 
-    print(f"Read {samples.shape} samples from {path} in {toc-tic:.2f} seconds")
+    print(f"Read {samples.shape} samples from {path} in {toc - tic:.2f} seconds")

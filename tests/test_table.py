@@ -26,8 +26,9 @@ def test_uniform_run_is_the_lines_without_their_terminator():
 
 
 def test_uniform_run_declines_on_a_broken_scan_counter():
-    # Right shape and flags everywhere, but the counters do not advance by a constant step,
-    # so these cannot be N consecutive headers: the hypothesis is not accepted.
+    # Right shape and flags everywhere, but the counters do not advance by a
+    # constant step, so these cannot be N consecutive headers: the hypothesis is
+    # not accepted.
     raw = b"".join(line(4, 2, counter=c)[0] for c in (1, 2, 7, 8)) + acqend(9)
     mm = np.frombuffer(raw, dtype=np.uint8)
     assert (
@@ -75,8 +76,8 @@ def test_walk_handles_a_non_adc_first_block():
 
 
 def test_walk_handles_several_runs_of_one_shape():
-    # Same shape either side of a sync block, but the run is interrupted, so the arithmetic
-    # path declines and the walk produces the lines.
+    # Same shape either side of a sync block, but the run is interrupted, so the
+    # arithmetic path declines and the walk produces the lines.
     raw = lines(4) + sync(320, 5) + lines(4, first_counter=6) + acqend(10)
     _, table, truncated = table_of(raw)
     assert not truncated
@@ -147,4 +148,6 @@ def test_read_headers_recovers_the_full_scan_headers():
     assert headers["Counter"]["Lin"].tolist() == list(range(5))
     assert headers["SamplesInScan"].tolist() == [4] * 5
     # Fields the compact table drops are still reachable.
-    assert {"IceProgramPara", "SliceData"} <= set(headers.dtype.names)
+    names = headers.dtype.names
+    assert names is not None
+    assert {"IceProgramPara", "SliceData"} <= set(names)

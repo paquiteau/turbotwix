@@ -2,15 +2,15 @@
 """Siemens PMU (physiological monitor) decoding: the SYNCDATA sideband payload.
 
 `docs/twix-format.md` describes the SYNCDATA block itself; `turbotwix.data`'s line-table
-walk records only each block's `(offset, length)` (`SYNC_DTYPE`), since nothing there can
-decode it. This module does: it turns those blocks into per-channel ECG/pulse/respiration
-signal, trigger and timestamp arrays (`Measurement.pmu`).
+walk records only each block's `(offset, length)` (`SYNC_DTYPE`), since nothing there
+can decode it. This module does: it turns those blocks into per-channel
+ECG/pulse/respiration signal, trigger and timestamp arrays (`Measurement.pmu`).
 
 The byte layout is undocumented by Siemens; re-derived from twixtools' `pmu.py` /
-`seqdata.py` (see NOTICE), which is itself the product of independent reverse-engineering.
-There are three on-disk variants, selected by the scanner's software version
-(`hdr['Dicom']['SoftwareVersions']`): classic (VB/VD/VE, e.g. "syngo MR E11"), and two XA
-variants split at syngo version 61.
+`seqdata.py` (see NOTICE), which is itself the product of independent
+reverse-engineering. There are three on-disk variants, selected by the scanner's
+software version (`hdr['Dicom']['SoftwareVersions']`): classic (VB/VD/VE, e.g.
+"syngo MR E11"), and two XA variants split at syngo version 61.
 """
 
 from __future__ import annotations
@@ -133,7 +133,8 @@ _EVENTS_XA61 = {
 
 
 class PmuBlock(NamedTuple):
-    """One decoded SYNCDATA/PMU packet: a handful of channels over one short interval."""
+    """One decoded SYNCDATA/PMU packet: a handful of channels over one short
+    interval."""
 
     timestamp: int  #: 2.5 ms ticks since midnight, same unit as `PMUTimeStamp`.
     duration: int
@@ -202,7 +203,8 @@ def _decode_xa_pre61(payload: bytes) -> PmuBlock:
 
 
 def _decode_xa61(payload: bytes) -> PmuBlock:
-    """The 61+ XA packet layout: f32 samples per channel, with an affine scale/offset."""
+    """The 61+ XA packet layout: f32 samples per channel, with an affine
+    scale/offset."""
     # packet header (16 B): version u2, size_header u1, _ u1, size_full_packet u4,
     # timestamp u8.
     timestamp = int(np.frombuffer(payload, dtype="<u8", count=1, offset=8)[0])
@@ -260,9 +262,10 @@ def _block_timestamps(block: PmuBlock, n_pts: int) -> np.ndarray:
         return (
             block.timestamp + np.linspace(0, block.duration, n_pts, endpoint=False)
         ) / 2.5e3
-    return block.timestamp + np.linspace(
-        0, block.duration / 10.0, n_pts, endpoint=False
-    ) / 2.5
+    return (
+        block.timestamp
+        + np.linspace(0, block.duration / 10.0, n_pts, endpoint=False) / 2.5
+    )
 
 
 class Pmu:

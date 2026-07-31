@@ -518,9 +518,11 @@ class LineTable:
 
         shapes = np.stack([self.rows["ncha"], self.rows["ncol"]], axis=1)
         unique_shapes, counts = np.unique(shapes, axis=0, return_counts=True)
-        return f"LineTable({len(self)} lines, shapes" + " ".join(
-            f"{n}x{tuple(s)}" for s, n in zip(unique_shapes, counts)
-        ) + ")"
+        return (
+            f"LineTable({len(self)} lines, shapes"
+            + " ".join(f"{n}x{tuple(s)}" for s, n in zip(unique_shapes, counts))
+            + ")"
+        )
 
     def __getattr__(self, name: str):
         if name in ["offset", "flags", "ncol", "ncha", "counters"]:

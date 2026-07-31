@@ -19,7 +19,7 @@ HAS_TWIXTOOLS = importlib.util.find_spec("twixtools") is not None
 
 
 def seqdata_block(ident: bytes, payload: bytes) -> bytes:
-    """A `SEQDATA_HEADER` + payload, as found right after a SYNCDATA block's scan header."""
+    """A `SEQDATA_HEADER` + payload, right after a SYNCDATA block's scan header."""
     header = np.zeros(1, dtype=tw.dtypes.SEQDATA_HEADER)[0]
     header["packet_size"] = len(payload)
     header["id"] = ident
