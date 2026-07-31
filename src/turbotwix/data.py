@@ -902,7 +902,7 @@ def _fold_index(
 
     if not minimal:
         counts = np.bincount(flat, minlength=int(np.prod(sizes)))
-        if counts.max(initial=0) > 1:
+        if int(np.max(counts)) > 1:
             varying = [
                 name
                 for name in COUNTERS

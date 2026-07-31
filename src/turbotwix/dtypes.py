@@ -10,6 +10,7 @@ NOTICE) and validated against real VD/VE files; field names follow the Siemens I
 from __future__ import annotations
 
 import enum
+import sys
 from typing import NamedTuple
 
 import numpy as np
@@ -225,8 +226,15 @@ SEQDATA_HEADER = np.dtype(
 
 #: Names of the 14 loop counters, in header order.
 
+if sys.version_info >= (3, 11):
+    StrEnum_ = enum.StrEnum
+else:
 
-class TwixVersion(enum.StrEnum):
+    class StrEnum_(str, enum.Enum):
+        pass
+
+
+class TwixVersion(StrEnum_):
     VB = "vb"  # VA / VB baselines: one measurement per file, no directory
     VD = "vd"  # VD11 ... VE11, early XA: a multi-raid container
 

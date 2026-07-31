@@ -1,13 +1,13 @@
 [project]
 name = "turbotwix"
-version = "0.1.1"
+version = "0.1.2"
 description = "High-throughput reader for Siemens MRI raw data (.dat / TWIX) files"
 readme = "README.md"
 license = "MIT"
 authors = [
     { name = "Pierre-antoine Comby", email = "pierre-antoine.comby@crans.org" }
 ]
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
     "numpy>=2.0",
 ]
