@@ -58,7 +58,8 @@ def test_read_lines_into_caller_buffer():
 
 def test_read_lines_empty_selection():
     mm, table, _ = build([(4, 2, 100, 0)])
-    assert tw.LineTable(table, mm, VD)[:0].read().shape == (0, 0, 0)
+    with pytest.raises(ValueError, match="Empty Table"):
+        tw.LineTable(table, mm, VD)[:0].read()
 
 
 def test_read_lines_irregularly_spaced_selection():
@@ -99,7 +100,7 @@ def test_selection_presets():
     assert picked(lines.noise) == [2]
     assert picked(lines.refscan) == [1, 3]  # reference-and-image counts here too
     assert picked(lines.phasecor) == [4]  # not 5: that one is reference-only
-    assert picked(lines.select(Flag.RTFEEDBACK)) == [6]
+    assert picked(lines[lines.has_flag(Flag.RTFEEDBACK)]) == [6]
 
 
 def test_selections_compose_and_stay_line_tables(epi_path):
@@ -134,9 +135,9 @@ def test_minimal_dims_keeps_genuinely_independent_counters():
     table["counters"]["Ave"] = [0, 0, 1]
     lines = tw.LineTable(table, mm, VD)
 
-    assert tw._varying_counters(lines) == ("Ave", "Seg")
-    assert tw.minimal_dims(lines) == ("Ave", "Seg")
-    dims, flat, sizes = tw._fold_index(lines, "minimal")  # no raise
+    assert tw.data._varying_counters(lines) == ("Ave", "Seg")
+    assert tw.data.minimal_dims(lines) == ("Ave", "Seg")
+    dims, flat, sizes = tw.data._fold_index(lines, "minimal")  # no raise
     assert dims == ("Ave", "Seg")
     assert tuple(sizes) == (2, 2)
 
@@ -159,7 +160,7 @@ def test_flags_and_counters(gre_path):
     assert len(lines) == 160  # the ACQEND terminator is not a line
     assert len(lines.image) == 160
     assert len(lines.noise) == 0
-    assert lines.has(Flag.ACQEND).sum() == 0  # not part of the table
+    assert lines.has_flag(Flag.ACQEND).sum() == 0  # not part of the table
     assert lines.image.counter("Lin").tolist() == list(range(160))
     assert lines.image.row_shape == (2, 320)
     assert lines.counters["Lin"].tolist() == lines.counter("Lin").tolist()
@@ -191,7 +192,7 @@ def test_read_into_preallocated_buffer(gre_path, tmp_path):
 def test_headers_available_on_demand(gre_path):
     headers = tw.open_twix(gre_path)[-1].lines.image.headers()
     assert len(headers) == 160
-    assert headers.dtype == tw.VD_SCAN_HEADER
+    assert headers.dtype == tw.dtypes.VD_SCAN_HEADER
     assert headers["Counter"]["Lin"].tolist() == list(range(160))
 
 
@@ -199,11 +200,11 @@ def _truncated_copy(src: str, dst: pathlib.Path) -> str:
     """Copy `src` cut off just before its ACQEND line, rewriting the raid entry length to
     0 so `parse_raid_directory` recomputes it from the new file size.
     """
-    mm = tw.open_mmap(src)
-    version = tw.detect_version(mm)
-    entry = tw.parse_raid_directory(mm, version)[-1]
-    _, hdr_len = tw.parse_protocol(mm, entry.offset)
-    table, _ = tw.build_table(
+    mm = tw.data.open_mmap(src)
+    version = tw.dtypes.detect_version(mm)
+    entry = tw.dtypes.parse_raid_directory(mm, version)[-1]
+    _, hdr_len = tw.header.parse_protocol(mm, entry.offset)
+    table, _ = tw.data.build_table(
         mm, entry.offset + hdr_len, entry.offset + entry.length, version
     )
     stride = int(table["offset"][1] - table["offset"][0])

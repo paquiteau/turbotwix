@@ -22,7 +22,7 @@ def line(
     ncol: int, ncha: int, flags: int = 0, counter: int = 1, lin: int = 0, base: float | None = None
 ) -> tuple[bytes, np.ndarray]:
     """One synthetic VD line; its samples carry recognisable values if `base` is given."""
-    header = np.zeros(1, dtype=tw.VD_SCAN_HEADER)[0]
+    header = np.zeros(1, dtype=tw.dtypes.VD_SCAN_HEADER)[0]
     header["SamplesInScan"] = ncol
     header["UsedChannels"] = ncha
     header["EvalInfoMask"] = flags
@@ -34,13 +34,16 @@ def line(
     for c in range(ncha):
         if base is not None:
             samples[c] = np.arange(ncol) + base + 1000 * c
-        raw += np.zeros(1, dtype=tw.VD_CHANNEL_HEADER)[0].tobytes() + samples[c].tobytes()
+        raw += (
+            np.zeros(1, dtype=tw.dtypes.VD_CHANNEL_HEADER)[0].tobytes()
+            + samples[c].tobytes()
+        )
     return raw, samples
 
 
 def acqend(counter: int = 1) -> bytes:
     """The terminator block: a bare scan header carrying ACQEND, no samples."""
-    header = np.zeros(1, dtype=tw.VD_SCAN_HEADER)[0]
+    header = np.zeros(1, dtype=tw.dtypes.VD_SCAN_HEADER)[0]
     header["EvalInfoMask"] = int(tw.Flag.ACQEND)
     header["ScanCounter"] = counter
     return header.tobytes()
@@ -48,17 +51,17 @@ def acqend(counter: int = 1) -> bytes:
 
 def sync(length: int, counter: int = 1) -> bytes:
     """A shape-less PMU/sideband block, whose length lives in the raw DMA field."""
-    header = np.zeros(1, dtype=tw.VD_SCAN_HEADER)[0]
+    header = np.zeros(1, dtype=tw.dtypes.VD_SCAN_HEADER)[0]
     header["EvalInfoMask"] = int(tw.Flag.SYNCDATA)
     header["FlagsAndDMALength"] = length
     header["ScanCounter"] = counter
-    return header.tobytes() + bytes(length - tw.VD_SCAN_HEADER.itemsize)
+    return header.tobytes() + bytes(length - tw.dtypes.VD_SCAN_HEADER.itemsize)
 
 
 def table_of(raw: bytes) -> tuple[np.ndarray, np.ndarray, bool]:
     """`(mm, table, truncated)` for a raw synthetic VD stream."""
     mm = np.frombuffer(raw, dtype=np.uint8)
-    rows, truncated = tw.build_table(mm, 0, mm.size, tw.TwixVersion.VD)
+    rows, truncated = tw.data.build_table(mm, 0, mm.size, tw.TwixVersion.VD)
     return mm, rows, truncated
 
 

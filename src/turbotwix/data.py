@@ -504,7 +504,7 @@ class LineTable:
         unique_shapes, counts = np.unique(shapes, axis=0, return_counts=True)
         return f"LineTable({len(self)} lines, shapes" + " ".join(
             f"{n}x{tuple(s)}" for s, n in zip(unique_shapes, counts)
-        )
+        ) + ")"
 
     def __getattr__(self, name: str):
         if name in ["offset", "flags", "ncol", "ncha", "counters"]:
@@ -557,7 +557,7 @@ class LineTable:
         out: np.ndarray | None = None,
         reflect: bool = True,
         dest: np.ndarray | None = None,
-        dims: tuple[str, ...] | Literal["minimal"] | None = "minimal",
+        dims: tuple[str, ...] | Literal["minimal"] | None = None,
     ) -> np.ndarray:
         """Read every line into a `(len(self), ncha, ncol)` array, compact or folded.
 
@@ -621,13 +621,15 @@ class LineTable:
                 raise ValueError("out is required when dest is given")
             if out.shape[1:] != self.row_shape:
                 raise ValueError(
-                    f"out must be (*, {*self.row_shape}) complex64, got {out.shape}"
+                    f"out must be (*, {self.row_shape}) complex64, got {out.shape}"
                 )
+            flat = dest
         else:  # dims and dest are both None
             if out is None:
                 out = np.empty(shape, dtype=np.complex64)
             elif out.shape != shape:
                 raise ValueError(f"out must be {shape} complex64, got {out.shape}")
+            flat = None
         self._read_into(out.reshape(-1, *self.row_shape), flat, reflect)
         return out
 
@@ -683,10 +685,10 @@ class LineTable:
         # them to the right order. Data is chunked to avoid creating a temporary
         # array that is too large.
         if reflect:
-            idx = np.flatnonzero(self.has_flags(Flag.REFLECT))
+            idx = np.flatnonzero(self.has_flag(Flag.REFLECT))
             if dest is not None:
                 idx = dest[idx]
-                chunk = max(1, _FLIP_BUDGET_BYTES // (8 * np.prod(self.row_shape)))
+            chunk = max(1, _FLIP_BUDGET_BYTES // (8 * np.prod(self.row_shape)))
             for at in range(0, idx.size, chunk):
                 picked = idx[at : at + chunk]
                 out[picked] = out[picked][:, :, ::-1]
@@ -704,7 +706,7 @@ class LineTable:
         numpy.ndarray
             Boolean `(len(self),)` mask.
         """
-        return (self.rows["flags"] & flag) == flag
+        return (self.rows["flags"] & np.uint64(flag)) == np.uint64(flag)
 
     def has_any_flag(self, flag: Flag) -> np.ndarray:
         """Boolean mask of lines carrying *any* bit of `flag`.
@@ -724,28 +726,28 @@ class LineTable:
     @property
     def image(self) -> LineTable:
         """Imaging lines: all but calibration, feedback and reference-only lines."""
-        return self[~self.has_any(_NOT_IMAGING) & ~self._reference_only]
+        return self[~self.has_any_flag(_NOT_IMAGING) & ~self._reference_only]
 
     @property
     def noise(self) -> LineTable:
         """Noise-calibration lines (for pre-whitening)."""
-        return self[self.has(Flag.NOISEADJSCAN)]
+        return self[self.has_flag(Flag.NOISEADJSCAN)]
 
     @property
     def refscan(self) -> LineTable:
         """Parallel-imaging reference lines."""
-        is_ref = self.has_any(Flag.PATREFSCAN | Flag.PATREFANDIMASCAN)
-        return self[is_ref & ~self.has_any(_NOT_PLAIN_REFERENCE)]
+        is_ref = self.has_any_flag(Flag.PATREFSCAN | Flag.PATREFANDIMASCAN)
+        return self[is_ref & ~self.has_any_flag(_NOT_PLAIN_REFERENCE)]
 
     @property
     def phasecor(self) -> LineTable:
         """Phase-correction (navigator) lines."""
-        return self[self.has(Flag.PHASCOR) & ~self._reference_only]
+        return self[self.has_flag(Flag.PHASCOR) & ~self._reference_only]
 
     @property
     def _reference_only(self) -> np.ndarray:
         """PATREFSCAN without PATREFANDIMASCAN: reference that is not also image."""
-        return self.has(Flag.PATREFSCAN) & ~self.has(Flag.PATREFANDIMASCAN)
+        return self.has_flag(Flag.PATREFSCAN) & ~self.has_flag(Flag.PATREFANDIMASCAN)
 
 
 def _varying_counters(lines: LineTable) -> tuple[str, ...]:

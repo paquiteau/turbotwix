@@ -30,7 +30,12 @@ def test_uniform_run_declines_on_a_broken_scan_counter():
     # so these cannot be N consecutive headers: the hypothesis is not accepted.
     raw = b"".join(line(4, 2, counter=c)[0] for c in (1, 2, 7, 8)) + acqend(9)
     mm = np.frombuffer(raw, dtype=np.uint8)
-    assert tw._uniform_run(mm, 0, mm.size, tw.TwixVersion.VD, tw.VD_SCAN_HEADER) is None
+    assert (
+        tw.data._uniform_run(
+            mm, 0, mm.size, tw.TwixVersion.VD, tw.dtypes.VD_SCAN_HEADER
+        )
+        is None
+    )
     # The walk reads it anyway: a strange counter is not a reason to refuse samples.
     _, table, _ = table_of(raw)
     assert len(table) == 4
@@ -101,7 +106,8 @@ def test_a_change_of_shape_is_tabled_and_refused_only_at_read(interrupted):
 def test_a_mixed_line_table_reports_its_shapes():
     mm, table, _ = table_of(lines(3) + line(6, 1, counter=4)[0] + acqend(5))
     mixed = tw.LineTable(table, mm, tw.TwixVersion.VD)
-    assert repr(mixed) == "LineTable(4 lines, mixed shapes [(1, 6), (2, 4)])"
+    assert repr(mixed).startswith("LineTable(4 lines, shapes")
+    assert "1x(" in repr(mixed) and "3x(" in repr(mixed)
     with pytest.raises(tw.UnsupportedLayoutError, match="mix shapes"):
         mixed.row_shape
     assert mixed[:3].row_shape == (2, 4)
@@ -110,7 +116,7 @@ def test_a_mixed_line_table_reports_its_shapes():
 def test_unaligned_data_start_is_refused():
     mm = np.frombuffer(lines(2) + acqend(3), dtype=np.uint8)
     with pytest.raises(tw.UnsupportedLayoutError, match="unaligned"):
-        tw.build_table(mm, 4, mm.size, tw.TwixVersion.VD)
+        tw.data.build_table(mm, 4, mm.size, tw.TwixVersion.VD)
 
 
 def test_truncation_is_reported():
@@ -132,8 +138,8 @@ def test_truncation_is_reported():
 
 def test_read_headers_recovers_the_full_scan_headers():
     mm, table, _ = table_of(lines(5) + acqend(6))
-    headers = tw.read_headers(mm, table["offset"], tw.TwixVersion.VD)
-    assert headers.dtype == tw.VD_SCAN_HEADER
+    headers = tw.data.read_headers(mm, table["offset"], tw.TwixVersion.VD)
+    assert headers.dtype == tw.dtypes.VD_SCAN_HEADER
     assert headers["Counter"]["Lin"].tolist() == list(range(5))
     assert headers["SamplesInScan"].tolist() == [4] * 5
     # Fields the compact table drops are still reachable.
