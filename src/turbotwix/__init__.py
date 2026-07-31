@@ -7,10 +7,13 @@ A file is read in three layers, one module each:
 * `turbotwix.header` — the text protocol: ascconv / XProtocol parsing, lazy per buffer.
 * `turbotwix.data` — the line table, sample extraction, and the object model built on
   top of them: `open_twix` -> `TwixFile` -> `Measurement` -> `LineTable`.
+* `turbotwix.pmu` — the SYNCDATA sideband payload: physiological (PMU) channels,
+  exposed as `Measurement.pmu`.
 
 The data model is the file's own: a measurement is a *list of acquisition lines*, each
 with its metadata and its `(ncha, ncol)` block of samples. Selecting lines is a boolean
-query over that table; reading returns `(n_lines, ncha, ncol)`. Folding onto a Cartesian
+query over that table; reading returns `(ncha, n_lines, ncol)` — channel first, matching
+its on-disk order, so it is contiguous with no extra transpose. Folding onto a Cartesian
 grid is available (`read(dims=...)`) but never implicit — for a spiral or radial
 acquisition the loop counters index shots, interleaves or spokes, and there is no grid
 to fold onto.
@@ -40,12 +43,14 @@ from .header import (
     AttrDict,
     Protocol,
 )
+from .pmu import Pmu
 
 __all__ = [
     "COUNTERS",
     "Flag",
     "LineTable",
     "Measurement",
+    "Pmu",
     "Protocol",
     "TwixFile",
     "TwixParseError",

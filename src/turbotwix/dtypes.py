@@ -24,6 +24,8 @@ __all__ = [
     "RAID_DIRECTORY",
     "RaidEntry",
     "SCAN_HEADER_DTYPES",
+    "SEQDATA_HEADER",
+    "SYNC_DTYPE",
     "TwixParseError",
     "TwixVersion",
     "UnsupportedLayoutError",
@@ -205,6 +207,21 @@ LINE_DTYPE = np.dtype(
     ]
 )
 # assert LINE_DTYPE.itemsize == 48
+
+#: One row per SYNCDATA/PMU block: enough to re-read and decode it on demand.
+SYNC_DTYPE = np.dtype([("offset", "<i8"), ("length", "<i8")])
+
+#: The header a SYNCDATA block's payload starts with, right after the scan header.
+#: `id` names the sideband stream; only ids starting with ``b"PMU"`` are physiological
+#: data (`turbotwix.pmu`). Re-derived from twixtools' `seqdata.SeqDataHeader`.
+SEQDATA_HEADER = np.dtype(
+    [
+        ("packet_size", "<u4"),
+        ("id", "S52"),
+        ("swapped", "<u4"),
+    ]
+)
+# assert SEQDATA_HEADER.itemsize == 60
 
 #: Names of the 14 loop counters, in header order.
 

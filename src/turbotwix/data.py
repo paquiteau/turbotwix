@@ -29,6 +29,7 @@ from .dtypes import (
     HEADER_SIZES,
     LINE_DTYPE,
     SCAN_HEADER_DTYPES,
+    SYNC_DTYPE,
     Flag,
     RaidEntry,
     TwixParseError,
@@ -38,6 +39,7 @@ from .dtypes import (
     parse_raid_directory,
 )
 from .header import Protocol, parse_protocol
+from .pmu import Pmu
 
 logger = logging.getLogger("turbotwix")
 
@@ -118,11 +120,12 @@ def open_mmap(path: str) -> np.memmap:
 
 def build_table(
     mm: np.ndarray, data_start: int, scan_end: int, version: TwixVersion
-) -> tuple[np.ndarray, bool]:
+) -> tuple[np.ndarray, np.ndarray, bool]:
     """Build the line table of one measurement.
 
-    Blocks that hold no samples (ACQEND, SYNCDATA/PMU) are stepped over, not recorded:
-    nothing here can decode them.
+    ACQEND blocks hold no samples and are stepped over, not recorded. SYNCDATA/PMU
+    blocks are also stepped over here, but their `(offset, length)` is recorded in
+    `sync` so `turbotwix.pmu` can decode them on demand.
 
     A measurement may mix `(ncha, ncol)` — an embedded parallel-imaging reference scan
     is Cartesian and short where the imaging lines are spiral and long, and a
@@ -163,6 +166,8 @@ def build_table(
     -------
     table : numpy.ndarray
         A `LINE_DTYPE` array with one row per ADC line.
+    sync : numpy.ndarray
+        A `SYNC_DTYPE` array with one `(offset, length)` row per SYNCDATA/PMU block.
     truncated : bool
         Whether the measurement ran out of bytes before its ACQEND block.
 
@@ -181,11 +186,11 @@ def build_table(
         )
     header_dtype = SCAN_HEADER_DTYPES[version]
     if data_start + header_dtype.itemsize > scan_end:
-        return np.empty(0, dtype=LINE_DTYPE), True
+        return np.empty(0, dtype=LINE_DTYPE), np.empty(0, dtype=SYNC_DTYPE), True
 
     uniform = _uniform_run(mm, data_start, scan_end, version, header_dtype)
     if uniform is not None:
-        table, truncated = uniform
+        table, sync, truncated = uniform
         logger.debug(
             "build_table: uniform run, %d lines%s",
             len(table),
@@ -204,7 +209,7 @@ def _uniform_run(
     scan_end: int,
     version: TwixVersion,
     header_dtype: np.dtype,
-) -> tuple[np.ndarray, bool] | None:
+) -> tuple[np.ndarray, np.ndarray, bool] | None:
     """The whole table by arithmetic, or None if this is not one uniform run.
 
     The hypothesis — the stride computed from the first header holds to the end — is
@@ -226,13 +231,16 @@ def _uniform_run(
 
     Returns
     -------
-    tuple of (numpy.ndarray, bool) or None
-        The `(table, truncated)` pair as for `build_table`, or None if the measurement
-        is not a single uniform run and the caller must fall back to `_walk`.
+    tuple of (numpy.ndarray, numpy.ndarray, bool) or None
+        The `(table, sync, truncated)` triplet as for `build_table` — `sync` is always
+        empty here, since a uniform run by construction never contains a SYNCDATA
+        block — or None if the measurement is not a single uniform run and the caller
+        must fall back to `_walk`.
     """
     hdr_size = header_dtype.itemsize
     prefix, chan_hdr = HEADER_SIZES[version]
     stop_bits = np.uint64(Flag.ACQEND | Flag.SYNCDATA)
+    empty_sync = np.empty(0, dtype=SYNC_DTYPE)
 
     first = mm[data_start : data_start + hdr_size].view(header_dtype)[0]
     ncol, ncha = int(first["SamplesInScan"]), int(first["UsedChannels"])
@@ -242,7 +250,7 @@ def _uniform_run(
     stride = prefix + ncha * (chan_hdr + 8 * ncol)
     n = (scan_end - data_start) // stride
     if n == 0:
-        return np.empty(0, dtype=LINE_DTYPE), True
+        return np.empty(0, dtype=LINE_DTYPE), empty_sync, True
 
     # A zero-copy strided view of the N candidate headers. `as_strided` does no bounds
     # checking; the division above is what keeps every one of them inside the region.
@@ -284,7 +292,7 @@ def _uniform_run(
     table["ncol"] = ncol
     table["ncha"] = ncha
     table["counters"] = headers["Counter"]
-    return table, truncated
+    return table, empty_sync, truncated
 
 
 def _walk(
@@ -293,7 +301,7 @@ def _walk(
     scan_end: int,
     version: TwixVersion,
     header_dtype: np.dtype,
-) -> tuple[np.ndarray, bool]:
+) -> tuple[np.ndarray, np.ndarray, bool]:
     """Step block by block, recording the ADC lines and skipping the rest.
 
     Deliberately plain: one Python iteration per *block*, which is affordable exactly
@@ -317,6 +325,8 @@ def _walk(
     -------
     table : numpy.ndarray
         A `LINE_DTYPE` array with one row per ADC line.
+    sync : numpy.ndarray
+        A `SYNC_DTYPE` array with one `(offset, length)` row per SYNCDATA/PMU block.
     truncated : bool
         Whether the walk ran out of bytes before reaching ACQEND.
 
@@ -331,6 +341,7 @@ def _walk(
     sync_bit = np.uint64(Flag.SYNCDATA)
 
     rows: list[tuple] = []
+    sync_rows: list[tuple[int, int]] = []
     pos = data_start
     truncated = False
 
@@ -365,6 +376,7 @@ def _walk(
                 if length <= 0 or pos + length > scan_end:
                     truncated = True
                     break
+                sync_rows.append((pos, length))
                 pos += length
                 if progress is not None:
                     progress.update(length)
@@ -393,7 +405,11 @@ def _walk(
             progress.close()
 
     logger.debug("_walk: %d lines%s", len(rows), " (truncated)" if truncated else "")
-    return np.array(rows, dtype=LINE_DTYPE), truncated
+    return (
+        np.array(rows, dtype=LINE_DTYPE),
+        np.array(sync_rows, dtype=SYNC_DTYPE),
+        truncated,
+    )
 
 
 def common_shape(table: np.ndarray) -> RowShape:
@@ -928,6 +944,21 @@ class Measurement:
         return self._header[0]
 
     @functools.cached_property
+    def _table(self) -> tuple[np.ndarray, np.ndarray, bool]:
+        data_start = self.offset + self._header[1]
+        rows, sync, truncated = build_table(
+            self._file.mm, data_start, self.offset + self.length, self._file.version
+        )
+        if truncated:
+            logger.warning(
+                "measurement %i ended before ACQEND after %i lines,"
+                " using the acquired lines only",
+                self.index,
+                len(rows),
+            )
+        return rows, sync, truncated
+
+    @functools.cached_property
     def lines(self) -> LineTable:
         """The acquisition lines of this measurement.
 
@@ -942,18 +973,20 @@ class Measurement:
         UserWarning
             When a truncated measurement is read anyway, giving the line count kept.
         """
-        data_start = self.offset + self._header[1]
-        rows, truncated = build_table(
-            self._file.mm, data_start, self.offset + self.length, self._file.version
-        )
-        if truncated:
-            logger.warning(
-                "measurement %i ended before ACQEND after %i lines,"
-                " using the acquired lines only",
-                self.index,
-                len(rows),
-            )
+        rows, _, _ = self._table
         return LineTable(rows, self._file.mm, self._file.version)
+
+    @functools.cached_property
+    def pmu(self) -> Pmu:
+        """The physiological (PMU) data interleaved with this measurement's lines.
+
+        Empty (no channels) when the measurement carries no SYNCDATA/PMU blocks, which
+        is the common case.
+        """
+        _, sync, _ = self._table
+        syngo_version = self.hdr["Dicom"]["SoftwareVersions"]
+        prefix, _ = HEADER_SIZES[self._file.version]
+        return Pmu.decode(self._file.mm, sync, prefix, syngo_version)
 
     def read(
         self,
