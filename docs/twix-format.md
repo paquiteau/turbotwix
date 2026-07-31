@@ -1,8 +1,9 @@
 # The Siemens TWIX (`.dat`) raw-data format
 
 What a Siemens MRI raw-data file actually contains, at the byte level, as implemented in
-this repository (mainly `src/turbotwix/dtypes.py` and `src/turbotwix/header.py`).
-Everything below is little-endian; all structures are unpadded/packed.
+this repository (mainly `src/turbotwix/dtypes.py`, `src/turbotwix/header.py` and
+`src/turbotwix/pmu.py`). Everything below is little-endian; all structures are
+unpadded/packed.
 
 The format is undocumented by the vendor. This description was re-derived from the
 reference readers (pymapvbvd, twixtools — see `NOTICE`) and validated against real VD/VE
@@ -195,7 +196,9 @@ which have no `ncol`/`ncha`-derived shape; for those the raw 25-bit field *is* t
   `allow_truncated=True`.
 - **SYNCDATA** (bit 5) — physiological/PMU and other sideband blocks interleaved with
   imaging lines. Not ADC data; length from the DMA field. A spiral file in testing
-  alternated 1–2 image lines of 5.04 MiB with one 2208-byte SYNCDATA block.
+  alternated 1–2 image lines of 5.04 MiB with one 2208-byte SYNCDATA block. The walk
+  steps over these blocks but records their `(offset, length)`; §9 describes how
+  `turbotwix.pmu` decodes the physiological ones on demand.
 - **Shape-less lines** show up in the table as `(ncha, ncol) = (0, 0)` — both sample
   files' tables report shapes `[(0, 0), (2, 320)]`, the first being the ACQEND row.
 
@@ -346,5 +349,55 @@ counter that increments once per block provides it.
   why turbotwix makes that assumption *loudly*, verifying it and raising.
 - **Counters are `uint16`** and are nominal indices, not offsets into acquired data.
 - **The first measurement is usually not the one you want** — adjustments come first.
-- **Not covered by this reader:** PMU/SYNCDATA payload decoding, ramp-sampling
-  regridding, slice-geometry (quaternion → orientation) interpretation.
+- **Not covered by this reader:** ramp-sampling regridding, slice-geometry (quaternion
+  → orientation) interpretation.
+
+## 9. PMU: the SYNCDATA payload
+
+Physiological (ECG/pulse/respiration) data rides inside SYNCDATA blocks as one sideband
+stream among others; `turbotwix.pmu` decodes it, given the `(offset, length)` the walk
+already recorded for every SYNCDATA block (§5).
+
+Right after a SYNCDATA block's scan header (192 B for VD/VE, 128 B for VB) comes a
+60-byte packed header (`SEQDATA_HEADER`): `packet_size: u4`, `id: char[52]`
+(NUL-terminated, e.g. `"PMU1"`), `swapped: u4`. Only blocks whose `id` starts with
+`"PMU"` are physiological data — other sideband streams (e.g. trajectory information)
+share the SYNCDATA flag but a different `id` — and `"PMULearnPhase..."` marks a
+calibration/learning-phase block rather than the real acquisition. `packet_size` bytes
+right after that header are the PMU payload proper; whatever follows it is unaccounted
+for ("appendix" in the reference readers).
+
+The payload itself has three on-disk variants, picked by the scanner's software version
+(`hdr['Dicom']['SoftwareVersions']`, `turbotwix.pmu.select_decoder`):
+
+- **classic** (VB/VD/VE, e.g. `"syngo MR E11"`): a 16-byte block header
+  (`timestamp0, timestamp, packet_no, duration`, all `u4`; `timestamp` is in the same
+  2.5 ms-tick unit as `PMUTimeStamp`), then repeated per-channel runs of
+  `magic: u4, period: u4, n_pts * (value: u16, trigger: u16)` — `n_pts = duration //
+  period` — terminated by an `END` magic (`0x01FF0000`). Channel magics: `ECG1..4`
+  (`0x0101_0000`.. `0x0104_0000`, aliased to one physical channel), `PULS`
+  (`0x0105_0000`), `RESP` (`0x0106_0000`), `EXT1`/`EXT2` (`0x0107_0000`/`0x0108_0000`).
+  Signal values are `/ 4096`; the trigger word is a boolean.
+- **XA, syngo < 61**: same shape, but `duration`/an unused `version` byte are packed
+  into one `u4`, magics are small integers (`ECG1..4 = 0..3`, `PULS = 4`, `RESP = 5`,
+  `EXT1/EXT2 = 6/7`, `EVENTS = 8`, `CardPT/RespPT = 9/10`), and samples are `u32`
+  (`/ 4095`) rather than `u16` — except `EVENTS`, whose samples are event codes
+  decoded into one boolean trigger channel per named event
+  (`turbotwix.pmu._EVENTS_XA_PRE61`).
+- **XA61+**: a longer per-channel header — `magic: u1, added_bytes: u1, size_one: u2,
+  size_data: u2, nb_samples: u2` (8 B), then `period, delta_timestamp: u4` (8 B, unused
+  here), then `ref_value, divisor, offset: f8` (24 B, `ref_value` unused) — followed by
+  `nb_samples` `f4` samples decoded as `value * divisor + offset`. Magic `49` is the
+  `EVENTS` channel, decoded the same way as the XA-pre-61 variant
+  (`turbotwix.pmu._EVENTS_XA61`); other magics name `ECG1..4`, `PULS`, `RSR1/RSR2`,
+  `RESP CUSH`, `EXT1/EXT2`, `CardPT`, `RespPT`.
+
+`turbotwix.pmu.Pmu.decode` walks a measurement's recorded SYNCDATA blocks, decodes each
+PMU one, and concatenates same-named channels across blocks (in block order) into
+`signal`/`trigger` arrays with matching per-sample `timestamp`/`timestamp_trigger`
+arrays — `Measurement.pmu`, lazily built and empty when a measurement carries no PMU
+data. As with the rest of this reader, the byte layout here was re-derived from
+pymapvbvd/twixtools, not from vendor documentation; there is no bundled test file that
+actually contains SYNCDATA/PMU blocks; the decoders are validated against synthetic
+blocks and, for the classic variant, against twixtools' own `PMUblock` (see
+`tests/test_pmu.py`).
