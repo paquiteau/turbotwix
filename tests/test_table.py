@@ -10,7 +10,9 @@ STRIDE = 192 + 2 * (32 + 8 * 4)  # one (ncha=2, ncol=4) VD line
 
 
 def lines(count: int, first_counter: int = 1) -> bytes:
-    return b"".join(line(4, 2, counter=first_counter + i, lin=i)[0] for i in range(count))
+    return b"".join(
+        line(4, 2, counter=first_counter + i, lin=i)[0] for i in range(count)
+    )
 
 
 def test_uniform_run_is_the_lines_without_their_terminator():
@@ -55,7 +57,9 @@ def test_walk_skips_interleaved_syncdata():
 
 
 def test_walk_handles_a_non_adc_first_block():
-    _, table, truncated = table_of(sync(256, 1) + line(4, 2, counter=2, lin=7)[0] + acqend(3))
+    _, table, truncated = table_of(
+        sync(256, 1) + line(4, 2, counter=2, lin=7)[0] + acqend(3)
+    )
     assert not truncated
     assert table["counters"]["Lin"].tolist() == [7]
     assert table["offset"].tolist() == [256]
@@ -99,8 +103,8 @@ def test_a_mixed_line_table_reports_its_shapes():
     mixed = tw.LineTable(table, mm, tw.TwixVersion.VD)
     assert repr(mixed) == "LineTable(4 lines, mixed shapes [(1, 6), (2, 4)])"
     with pytest.raises(tw.UnsupportedLayoutError, match="mix shapes"):
-        mixed.shape
-    assert mixed[:3].shape == (2, 4)
+        mixed.row_shape
+    assert mixed[:3].row_shape == (2, 4)
 
 
 def test_unaligned_data_start_is_refused():

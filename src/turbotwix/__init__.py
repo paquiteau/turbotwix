@@ -31,7 +31,6 @@ from .data import (
 from .dtypes import (
     COUNTERS,
     Flag,
-    TruncatedFileError,
     TwixParseError,
     TwixVersion,
     UnsupportedLayoutError,
@@ -48,7 +47,6 @@ __all__ = [
     "LineTable",
     "Measurement",
     "Protocol",
-    "TruncatedFileError",
     "TwixFile",
     "TwixParseError",
     "TwixVersion",

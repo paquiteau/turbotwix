@@ -24,7 +24,6 @@ __all__ = [
     "RAID_DIRECTORY",
     "RaidEntry",
     "SCAN_HEADER_DTYPES",
-    "TruncatedFileError",
     "TwixParseError",
     "TwixVersion",
     "UnsupportedLayoutError",
@@ -33,18 +32,12 @@ __all__ = [
     "VD_CHANNEL_HEADER",
     "VD_SCAN_HEADER",
     "detect_version",
-    "has_any_flag",
-    "has_flag",
     "parse_raid_directory",
 ]
 
 
 class TwixParseError(Exception):
     """Raised when the binary structure of a .dat file cannot be parsed."""
-
-
-class TruncatedFileError(TwixParseError):
-    """Raised when a measurement ends before an ACQEND block is reached."""
 
 
 class UnsupportedLayoutError(TwixParseError):
@@ -426,40 +419,3 @@ Flag.__doc__ = "One bit of a line's 64-bit EvalInfoMask."
 # first word; a normal line's length is recomputed from `(ncol, ncha)`, because Siemens'
 # PackBit compression can make that field disagree with the real one.
 _DMA_LEN_MASK = 2**25 - 1
-
-
-def has_flag(flags: np.ndarray, flag: int) -> np.ndarray:
-    """Vectorized "carries *all* bits of `flag`" over an array of masks.
-
-    Parameters
-    ----------
-    flags : numpy.ndarray
-        ``uint64`` EvalInfoMask values, one per line.
-    flag : int
-        The bit or combination of bits to test for, typically a `Flag`.
-
-    Returns
-    -------
-    numpy.ndarray
-        Boolean array, True where every bit of `flag` is set.
-    """
-    wanted = np.uint64(int(flag))
-    return (np.asarray(flags) & wanted) == wanted
-
-
-def has_any_flag(flags: np.ndarray, flag: int) -> np.ndarray:
-    """Vectorized "carries *any* bit of `flag`" — one test for a whole set of bits.
-
-    Parameters
-    ----------
-    flags : numpy.ndarray
-        ``uint64`` EvalInfoMask values, one per line.
-    flag : int
-        The bits to test for, typically a union of `Flag` members.
-
-    Returns
-    -------
-    numpy.ndarray
-        Boolean array, True where at least one bit of `flag` is set.
-    """
-    return (np.asarray(flags) & np.uint64(int(flag))) != 0

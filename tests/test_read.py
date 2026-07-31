@@ -111,7 +111,7 @@ def test_selections_compose_and_stay_line_tables(epi_path):
     assert 0 < len(first_seg) <= len(m.lines.image)
     assert repr(m.lines.image).startswith("LineTable(80 lines")
     assert repr(m.lines[:0]) == "LineTable(0 lines)"
-    assert m.lines[:0].shape == (0, 0)
+    assert m.lines[:0].row_shape == (0, 0)
 
 
 # --- read(dims=...) --------------------------------------------------------
@@ -161,7 +161,7 @@ def test_flags_and_counters(gre_path):
     assert len(lines.noise) == 0
     assert lines.has(Flag.ACQEND).sum() == 0  # not part of the table
     assert lines.image.counter("Lin").tolist() == list(range(160))
-    assert lines.image.shape == (2, 320)
+    assert lines.image.row_shape == (2, 320)
     assert lines.counters["Lin"].tolist() == lines.counter("Lin").tolist()
 
 
@@ -214,20 +214,3 @@ def _truncated_copy(src: str, dst: pathlib.Path) -> str:
     raw[len_offset : len_offset + 8] = struct.pack("<Q", 0)
     dst.write_bytes(raw)
     return str(dst)
-
-
-def test_truncated_file_raises_unless_allowed(gre_path, tmp_path):
-    path = _truncated_copy(gre_path, tmp_path / "truncated.dat")
-
-    with pytest.raises(tw.TruncatedFileError):
-        tw.open_twix(path)[-1].lines
-
-    with pytest.warns(UserWarning, match="before ACQEND"):
-        m = tw.open_twix(path, allow_truncated=True)[-1]
-        lines = m.lines
-    assert len(lines.image) == 160
-
-    reference = tw.open_twix(gre_path)[-1]
-    np.testing.assert_array_equal(
-        m.read(lines.image), reference.read(reference.lines.image)
-    )

@@ -11,11 +11,11 @@ from __future__ import annotations
 import functools
 import logging
 import mmap as _mmap
-import warnings
-from typing import Literal
+from typing import Literal, NamedTuple, TypedDict
 
 import numpy as np
 from numpy.lib.stride_tricks import as_strided
+from numpy.typing import NDArray
 
 try:  # optional dependency, only used for the _walk progress bar
     from tqdm import tqdm
@@ -31,13 +31,10 @@ from .dtypes import (
     SCAN_HEADER_DTYPES,
     Flag,
     RaidEntry,
-    TruncatedFileError,
     TwixParseError,
     TwixVersion,
     UnsupportedLayoutError,
     detect_version,
-    has_any_flag,
-    has_flag,
     parse_raid_directory,
 )
 from .header import Protocol, parse_protocol
@@ -77,6 +74,23 @@ _NOT_PLAIN_REFERENCE = (
     | Flag.RTFEEDBACK
     | Flag.HPFEEDBACK
 )
+
+
+class RowShape(NamedTuple):
+    """The `(ncha, ncol)` shape of one line."""
+
+    ncha: int
+    ncol: int
+
+
+class RowStruct(TypedDict):
+    """One row of the line table."""
+
+    offset: NDArray[np.int64]
+    flags: NDArray[np.uint64]
+    ncol: NDArray[np.uint16]
+    ncha: NDArray[np.uint16]
+    counters: NDArray[np.void]
 
 
 def open_mmap(path: str) -> np.memmap:
@@ -382,7 +396,7 @@ def _walk(
     return np.array(rows, dtype=LINE_DTYPE), truncated
 
 
-def common_shape(table: np.ndarray) -> tuple[int, int]:
+def common_shape(table: np.ndarray) -> RowShape:
     """The one `(ncha, ncol)` of every line in `table`.
 
     Parameters
@@ -402,10 +416,10 @@ def common_shape(table: np.ndarray) -> tuple[int, int]:
         `.image`, `.refscan`, `.noise` usually separate them.
     """
     if len(table) == 0:
-        return (0, 0)
+        return RowShape(0, 0)
     ncha, ncol = int(table["ncha"][0]), int(table["ncol"][0])
     if len(table) == 1:
-        return (ncha, ncol)
+        return RowShape(ncha, ncol)
     shapes, counts = np.unique(
         np.stack([table["ncha"], table["ncol"]], axis=1), axis=0, return_counts=True
     )
@@ -419,7 +433,7 @@ def common_shape(table: np.ndarray) -> tuple[int, int]:
             f"(n_lines, ncha, ncol) array, so select a single-shaped subset first — "
             f"e.g. .image, .refscan or .noise."
         )
-    return (ncha, ncol)
+    return RowShape(ncha, ncol)
 
 
 def read_headers(
@@ -469,46 +483,36 @@ class LineTable:
         The layout detected by `detect_version`.
     """
 
-    def __init__(self, rows: np.ndarray, mm: np.ndarray, version: TwixVersion) -> None:
-        self._rows = rows
+    def __init__(
+        self, rows: NDArray[np.void], mm: NDArray, version: TwixVersion
+    ) -> None:
+        self.rows = rows
         self._mm = mm
         self._version = version
 
     def __len__(self) -> int:
-        return len(self._rows)
+        return len(self.rows)
 
     def __getitem__(self, key) -> LineTable:
-        return LineTable(np.atleast_1d(self._rows[key]), self._mm, self._version)
+        return LineTable(np.atleast_1d(self.rows[key]), self._mm, self._version)
 
     def __repr__(self) -> str:
         if len(self) == 0:
             return "LineTable(0 lines)"
 
-        shapes = np.stack([self._rows["ncha"], self._rows["ncol"]], axis=1)
+        shapes = np.stack([self.rows["ncha"], self.rows["ncol"]], axis=1)
         unique_shapes, counts = np.unique(shapes, axis=0, return_counts=True)
         return f"LineTable({len(self)} lines, shapes" + " ".join(
             f"{n}x{tuple(s)}" for s, n in zip(unique_shapes, counts)
         )
 
-    @property
-    def rows(self) -> np.ndarray:
-        """The raw `LINE_DTYPE` array (offset, flags, ncol, ncha, counters)."""
-        return self._rows
-
-    @property
-    def offset(self) -> np.ndarray:
-        """Absolute byte offset of each line's scan header."""
-        return self._rows["offset"]
-
-    @property
-    def flags(self) -> np.ndarray:
-        """Each line's 64-bit `EvalInfoMask`. Query it with `has` / `has_any`."""
-        return self._rows["flags"]
-
-    @property
-    def counters(self) -> np.ndarray:
-        """Structured `(N,)` array with one field per loop counter (see `COUNTERS`)."""
-        return self._rows["counters"]
+    def __getattr__(self, name: str):
+        if name in ["offset", "flags", "ncol", "ncha", "counters"]:
+            return self.rows[name]
+        else:
+            raise AttributeError(
+                f"{type(self).__name__!r} object has no attribute {name!r}"
+            )
 
     def counter(self, name: str) -> np.ndarray:
         """One loop counter's value for every line.
@@ -523,10 +527,10 @@ class LineTable:
         numpy.ndarray
             The `(N,)` int64 counter values.
         """
-        return self._rows["counters"][name].astype(np.int64)
+        return self.rows["counters"][name].astype(np.int64)
 
-    @property
-    def shape(self) -> tuple[int, int]:
+    @functools.cached_property
+    def row_shape(self) -> RowShape:
         """The `(ncha, ncol)` shape shared by these lines.
 
         Raises
@@ -535,7 +539,7 @@ class LineTable:
             If the selection mixes shapes, as a measurement with an embedded reference
             scan does. Select a single-shaped subset (`.image`, `.refscan`, `.noise`).
         """
-        return common_shape(self._rows)
+        return common_shape(self.rows)
 
     def headers(self) -> np.ndarray:
         """The full VB/VD scan headers of these lines, re-read from the file.
@@ -553,26 +557,16 @@ class LineTable:
         out: np.ndarray | None = None,
         reflect: bool = True,
         dest: np.ndarray | None = None,
-        dims: tuple[str, ...] | Literal["minimal"] | None = None,
+        dims: tuple[str, ...] | Literal["minimal"] | None = "minimal",
     ) -> np.ndarray:
         """Read every line into a `(len(self), ncha, ncol)` array, compact or folded.
 
-        Without `dims`, that shape *is* the file's own layout — one contiguous
-        `(ncha, ncol)` block per line, in file order — so reading is a strided copy: no
-        index arithmetic, no gather and no intermediate buffer, which is what makes an
-        `out=` memmap enough to read files far larger than RAM.
-
-        With `dims`, folds `self` onto a Cartesian grid indexed by those counters —
-        `dims="minimal"` picks the counters that vary, as for `minimal_dims` — by
-        computing each line's grid position from its counters alone (`_fold_index`,
-        metadata-scale) and reading straight into that cell, rather than into a compact
-        buffer that is then folded separately. Raises if two lines land on the same
-        grid cell, which normally means a varying counter is missing from `dims`.
+        Requires that every line has the same `(ncha, ncol)`.
 
         Parameters
         ----------
         out : numpy.ndarray, optional
-            Preallocated destination — a `numpy.memmap`, a slice of a bigger array.
+            Preallocated destination.
             Without `dims`: `(len(self), ncha, ncol)` complex64 when `dest` is not
             given (allocated if not given either); `(*, ncha, ncol)` complex64,
             required, when `dest` is given. With `dims`: `(*dim_sizes, ncha, ncol)` or
@@ -607,144 +601,97 @@ class LineTable:
         UnsupportedLayoutError
             If `self` mixes `(ncha, ncol)`: the result would not be rectangular.
         """
-        if dims is not None:
-            if dest is not None:
-                raise ValueError("dest is not supported together with dims")
-            return self._read_folded(out=out, reflect=reflect, dims=dims)
+        n = len(self.rows)
+        if n == 0:
+            raise ValueError("Empty Table, nothing to read.")
+        shape = (n, *self.row_shape)
+        if out is not None and out.dtype != np.complex64:
+            raise ValueError(f"out must be complex64, got {out.dtype}")
+        if dims is not None and dest is not None:
+            raise ValueError("dest is not supported together with dims")
 
-        table = self._rows
-        n = len(table)
-        ncha, ncol = common_shape(table)
-        if dest is None:
-            shape = (n, ncha, ncol)
+        elif dims is not None and dest is None:
+            _, flat, sizes = _fold_index(self, dims)
+            grid_shape = (*sizes, *self.row_shape)
             if out is None:
-                out = np.empty(shape, dtype=np.complex64)
-            elif out.shape != shape or out.dtype != np.complex64:
-                raise ValueError(
-                    f"out must be {shape} complex64, got {out.shape} {out.dtype}"
-                )
-        else:
+                out = np.zeros(grid_shape, dtype=np.complex64)
+
+        elif dims is None and dest is not None:
             if out is None:
                 raise ValueError("out is required when dest is given")
-            if out.dtype != np.complex64 or out.shape[1:] != (ncha, ncol):
+            if out.shape[1:] != self.row_shape:
                 raise ValueError(
-                    f"out must be (*, {ncha}, {ncol}) complex64, "
-                    f"got {out.shape} {out.dtype}"
+                    f"out must be (*, {*self.row_shape}) complex64, got {out.shape}"
                 )
-        if n == 0:
-            return out
+        else:  # dims and dest are both None
+            if out is None:
+                out = np.empty(shape, dtype=np.complex64)
+            elif out.shape != shape:
+                raise ValueError(f"out must be {shape} complex64, got {out.shape}")
+        self._read_into(out.reshape(-1, *self.row_shape), flat, reflect)
+        return out
 
-        logger.debug("LineTable.read: %d lines, (%d, %d) samples each", n, ncha, ncol)
+    def _read_into(
+        self,
+        out: np.ndarray,
+        dest: np.ndarray | None,
+        reflect: bool,
+    ) -> None:
+        """Copy `table`'s samples into `out` (row `i`, or `dest[i]` if given), in place.
+
+        The core shared by both of `read`'s branches (compact/`dest` and folded/`dims`):
+        by the time this runs, `out`'s shape and `dest`'s meaning are already the
+        caller's responsibility, validated.
+        """
+        n = len(self.rows)
+        logger.debug("%d lines, %s samples each", n, self.row_shape)
         prefix, chan_hdr = HEADER_SIZES[self._version]
-        block = chan_hdr + 8 * ncol  # one channel: its header, then its samples
-        # Index in complex64 units, not bytes: `build_table` has verified that every
-        # offset involved is a multiple of 8.
+        # size for a single channel: its header, then its samples
+        chan_block_size = chan_hdr + 8 * self.row_shape.ncol
+        # The whole file as a complex64 array, ignoring any trailing bytes.
         c8 = np.asarray(self._mm[: (self._mm.size // 8) * 8].view("<c8"))
-        starts = (table["offset"].astype(np.int64) + prefix + chan_hdr) // 8
+        # The byte offset of each line's first sample, as an index into `c8`.
 
-        # An index-array gather would need an int64 index per complex64 sample — as
-        # much index traffic as data traffic — where a strided view is a plain memcpy.
-        # Evenly spaced lines (the norm, since a measurement is usually one uniform
-        # run) are a single view for the whole selection; an irregular selection is one
-        # view per line, each still at a fixed within-line stride. Scattering to `dest`
-        # instead of writing row `i` is just a different assignment target — numpy's
-        # fancy-index assignment handles it in one vectorized call, same as the
-        # sequential case.
+        starts = (self.rows["offset"].astype(np.int64) + prefix + chan_hdr) // 8
+
+        # Try to do a strided copy of the whole selection at once when the
+        # offsets are evenly spaced.
+        # Otherwise, fall back to copy each line one by one.
         step = int(starts[1] - starts[0]) if n > 1 else 0
         if step > 0 and np.all(np.diff(starts) == step):
             view = as_strided(
                 c8[int(starts[0]) :],
-                shape=(n, ncha, ncol),
-                strides=(8 * step, block, 8),
+                shape=(n, *self.row_shape),
+                strides=(8 * step, chan_block_size, 8),
             )
             if dest is None:
                 np.copyto(out, view)
             else:
                 out[dest] = view
         else:
-            logger.debug(
-                "LineTable.read: %d irregularly-spaced lines, reading one by one", n
-            )
+            logger.debug("%d irregularly-spaced lines, reading one by one", n)
             iterator = enumerate(starts)
+            if dest is None:
+                dest = np.arange(n, dtype=np.int64)
             if tqdm is not None:
-                iterator = tqdm(
-                    iterator,
-                    total=n,
-                    unit="line",
-                    desc="turbotwix: reading lines",
-                    leave=False,
-                )
+                iterator = tqdm(iterator, unit="line", desc="turbotwix: reading lines")
             for i, start in iterator:
-                row = i if dest is None else int(dest[i])
-                out[row] = as_strided(
-                    c8[int(start) :], shape=(ncha, ncol), strides=(block, 8)
+                out[dest[i]] = as_strided(
+                    c8[int(start) :], shape=self.row_shape, strides=(chan_block_size, 8)
                 )
-
+        # Apply reflect Flag: the samples are stored backwards on disk, so flip
+        # them to the right order. Data is chunked to avoid creating a temporary
+        # array that is too large.
         if reflect:
-            idx = np.flatnonzero(has_flag(table["flags"], Flag.REFLECT))
+            idx = np.flatnonzero(self.has_flags(Flag.REFLECT))
             if dest is not None:
                 idx = dest[idx]
-            chunk = max(1, _FLIP_BUDGET_BYTES // max(8 * ncha * ncol, 1))
+                chunk = max(1, _FLIP_BUDGET_BYTES // (8 * np.prod(self.row_shape)))
             for at in range(0, idx.size, chunk):
                 picked = idx[at : at + chunk]
                 out[picked] = out[picked][:, :, ::-1]
-        return out
 
-    def _read_folded(
-        self,
-        *,
-        out: np.ndarray | None,
-        reflect: bool,
-        dims: tuple[str, ...] | Literal["minimal"],
-    ) -> np.ndarray:
-        """The `dims=` branch of `read`: fold `self` onto a grid and fill it.
-
-        Parameters
-        ----------
-        out : numpy.ndarray, optional
-            Preallocated `(*dim_sizes, ncha, ncol)` or `(prod(dim_sizes), ncha, ncol)`
-            complex64 destination; allocated and zero-filled if not given.
-        reflect : bool
-            Un-reverse the lines flagged REFLECT.
-        dims : tuple of str or {'minimal'}
-            The counter names to use as grid axes, as for `read`.
-
-        Returns
-        -------
-        numpy.ndarray
-            The `(*dim_sizes, ncha, ncol)` grid; `out` itself, reshaped, when given.
-
-        Raises
-        ------
-        ValueError
-            If `out` does not have a shape compatible with the resolved `dims`.
-        """
-        ncha, ncol = self.shape
-        resolved_dims, flat, sizes = _fold_index(self, dims)
-        n_flat = int(np.prod(sizes))
-        grid_shape = (*sizes, ncha, ncol)
-
-        if out is None:
-            flat_out = np.zeros((n_flat, ncha, ncol), dtype=np.complex64)
-            self.read(out=flat_out, dest=flat, reflect=reflect)
-            return flat_out.reshape(grid_shape)
-
-        if out.dtype != np.complex64:
-            raise ValueError(f"out must be complex64, got {out.dtype}")
-        if out.shape == grid_shape:
-            flat_out = out.reshape(n_flat, ncha, ncol)
-        elif out.shape == (n_flat, ncha, ncol):
-            flat_out = out
-        else:
-            raise ValueError(
-                f"out must be {grid_shape} or ({n_flat}, {ncha}, {ncol}) complex64 "
-                f"to match dims={resolved_dims}, got {out.shape}"
-            )
-        self.read(out=flat_out, dest=flat, reflect=reflect)
-        return out
-
-    # -- selection ---------------------------------------------------------
-    def has(self, flag: Flag) -> np.ndarray:
+    def has_flag(self, flag: Flag) -> np.ndarray:
         """Boolean mask of lines carrying *all* bits of `flag`.
 
         Parameters
@@ -757,9 +704,9 @@ class LineTable:
         numpy.ndarray
             Boolean `(len(self),)` mask.
         """
-        return has_flag(self.flags, flag)
+        return (self.rows["flags"] & flag) == flag
 
-    def has_any(self, flag: Flag) -> np.ndarray:
+    def has_any_flag(self, flag: Flag) -> np.ndarray:
         """Boolean mask of lines carrying *any* bit of `flag`.
 
         Parameters
@@ -772,22 +719,7 @@ class LineTable:
         numpy.ndarray
             Boolean `(len(self),)` mask.
         """
-        return has_any_flag(self.flags, flag)
-
-    def select(self, flag: Flag) -> LineTable:
-        """The lines carrying all bits of `flag`.
-
-        Parameters
-        ----------
-        flag : Flag
-            The bit or combination of bits to select on.
-
-        Returns
-        -------
-        LineTable
-            The matching lines.
-        """
-        return self[self.has(flag)]
+        return (self.rows["flags"] & np.uint64(flag)) != 0
 
     @property
     def image(self) -> LineTable:
@@ -797,7 +729,7 @@ class LineTable:
     @property
     def noise(self) -> LineTable:
         """Noise-calibration lines (for pre-whitening)."""
-        return self.select(Flag.NOISEADJSCAN)
+        return self[self.has(Flag.NOISEADJSCAN)]
 
     @property
     def refscan(self) -> LineTable:
@@ -1013,14 +945,12 @@ class Measurement:
             self._file.mm, data_start, self.offset + self.length, self._file.version
         )
         if truncated:
-            message = (
-                f"measurement {self.index} ended before ACQEND after {len(rows)} lines"
+            logger.warning(
+                "measurement %i ended before ACQEND after %i lines,"
+                " using the acquired lines only",
+                self.index,
+                len(rows),
             )
-            if not self._file.allow_truncated:
-                raise TruncatedFileError(
-                    f"{message}; pass allow_truncated=True to read anyway"
-                )
-            warnings.warn(f"{message}; using the acquired lines only", stacklevel=2)
         return LineTable(rows, self._file.mm, self._file.version)
 
     def read(
@@ -1032,11 +962,6 @@ class Measurement:
         reflect: bool = True,
     ) -> np.ndarray:
         """Read the samples of `lines`, compact or folded onto a grid.
-
-        A shell around `LineTable.read`, which does all the validation and folding;
-        this only picks the default table — every line of the measurement without
-        `dims`, the imaging lines with it, since folding onto a grid needs a single
-        `(ncha, ncol)` shape.
 
         Parameters
         ----------
@@ -1066,16 +991,15 @@ class TwixFile:
     """A memory-mapped `.dat` file and the measurements it contains.
 
     Indexable and iterable over its `Measurement` objects, in acquisition order. `scan`
-    is the last of them — the actual scan, rather than the adjustments before it — and
-    `hdr`, `lines` and `read` are shorthands for its members, so the common
-    case needs no indexing at all.
+    is the last of them, and very likely the one that contains the data you are after.
+    ``hdr``, ``lines`` and ``read`` are shorthands for ``.scan.hdr``,
+    ``scan.lines`` and ``.scan.lines.read(...)``
+
 
     Parameters
     ----------
     path : str
         Path to the `.dat` file.
-    allow_truncated : bool, default False
-        Read a measurement that ends before ACQEND, warning instead of raising.
 
     Raises
     ------
@@ -1091,9 +1015,8 @@ class TwixFile:
     >>> noise = f[0].lines.noise  # an earlier one, explicitly
     """
 
-    def __init__(self, path: str, *, allow_truncated: bool = False) -> None:
+    def __init__(self, path: str) -> None:
         self.path = path
-        self.allow_truncated = allow_truncated
         self._mm = open_mmap(path)
         self.version = detect_version(self.mm)
         # Zero-length entries are aborted measurements with no data written; the
@@ -1143,24 +1066,17 @@ class TwixFile:
 
     @property
     def scan(self) -> Measurement:
-        """The last measurement — the one you almost always want.
-
-        A `.dat` file is written in acquisition order, and a scan is commonly preceded
-        by the adjustments it needed (coil sensitivity, noise). The interesting one is
-        therefore the last, and `hdr`, `lines` and `read` on the file are
-        shorthands for the same members of this measurement. Index the file (`f[0]`,
-        `f[-2]`) or iterate it to reach the others.
-        """
+        """Shorthand for last measurement in file, the one you almost always want."""
         return self.measurements[-1]
 
     @property
     def hdr(self) -> Protocol:
-        """`scan.hdr` — the parsed text protocol of the last measurement."""
+        """Header of the scan measurement."""
         return self.scan.hdr
 
     @property
     def lines(self) -> LineTable:
-        """`scan.lines` — the acquisition lines of the last measurement."""
+        """Raw acquisition lines of the scan measurement, as a queryable table."""
         return self.scan.lines
 
     def read(
@@ -1194,7 +1110,7 @@ class TwixFile:
         )
 
 
-def open_twix(path: str, *, allow_truncated: bool = False) -> TwixFile:
+def open_twix(path) -> TwixFile:
     """Open a Siemens `.dat` (TWIX) file.
 
     Nothing is read beyond the raid directory: protocols and line tables are parsed per
@@ -1210,12 +1126,10 @@ def open_twix(path: str, *, allow_truncated: bool = False) -> TwixFile:
     ----------
     path : str
         Path to the `.dat` file.
-    allow_truncated : bool, default False
-        Read a measurement that ends before ACQEND, warning instead of raising.
 
     Returns
     -------
     TwixFile
         The open file, indexable and iterable over its `Measurement` objects.
     """
-    return TwixFile(path, allow_truncated=allow_truncated)
+    return TwixFile(path)
