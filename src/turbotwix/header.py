@@ -11,7 +11,7 @@ import struct
 
 import numpy as np
 
-__all__ = ["AttrDict", "Protocol", "parse_protocol"]
+__all__ = ["AttrDict", "Protocol", "parse_protocol", "search_header_for_val"]
 
 _BUFFER_NAME = re.compile(rb"(\w{4,})\x00(.{4})", re.DOTALL)
 _ASCCONV = re.compile(r"### ASCCONV BEGIN[^\n]*\n(.*)\s### ASCCONV END ###", re.DOTALL)
@@ -45,6 +45,28 @@ class AttrDict(dict):
 
     __setattr__ = dict.__setitem__
 
+    def __getitem__(self, key):
+        """A plain key indexes as usual; a tuple walks it as a nested path.
+
+        `prot["sSliceArray"]["asSlice"][0]["dThickness"]` and
+        `prot["sSliceArray", "asSlice", 0, "dThickness"]` are equivalent -- the tuple
+        form is just a shorthand that steps through nested dicts and lists (list steps
+        are plain integer indices) in one call.
+        """
+        if isinstance(key, tuple):
+            node = self
+            for step in key:
+                node = node[step]
+            return node
+        return dict.__getitem__(self, key)
+
+    def get(self, key, default=None):
+        """`self[key]` (plain or tuple/path), or `default` if any step is missing."""
+        try:
+            return self[key]
+        except (KeyError, IndexError, TypeError):
+            return default
+
 
 class Protocol(AttrDict):
     """Buffer name -> parsed contents, with each buffer parsed on first access.
@@ -57,15 +79,12 @@ class Protocol(AttrDict):
     through, so the laziness is not observable apart from where the time is spent.
     """
 
-    def __getitem__(self, name: str):
-        value = dict.__getitem__(self, name)
+    def __getitem__(self, key: str):
+        value = dict.__getitem__(self, key)
         if isinstance(value, bytes):  # raw buffer, not parsed yet
             value = AttrDict(_parse_buffer(value.decode("latin1")))
-            dict.__setitem__(self, name, value)
+            dict.__setitem__(self, key, value)
         return value
-
-    def get(self, name, default=None):
-        return self[name] if name in self else default
 
     def values(self):
         return [self[name] for name in self]
@@ -287,6 +306,57 @@ def _parse_xprot(buffer: str) -> dict:
         else:
             xprot[name] = _cast_xprot(body, kind)
     return xprot
+
+
+def search_header_for_val(node: dict | list, *path: str) -> list:
+    """Recursively collect every value stored under the trailing key chain `path`.
+
+    pymapvbvd's `search_header_for_val` exists because its ascconv tree is flat (keyed
+    by the full dotted/indexed path), so finding a parameter means a regex/substring
+    scan of every key in a buffer -- and that scan can match more than intended (an
+    unrelated key that merely contains the search term as a substring). turbotwix's
+    tree is a real nested structure, so the equivalent search is an exact, structural
+    one: `path` is matched as a contiguous, case-sensitive tail of the branch leading
+    to a value, however deep that branch starts.
+
+    Examples
+    --------
+    >>> search_header_for_val(m.hdr.Phoenix, "sFastImaging", "lTurboFactor")
+    [1]
+    >>> search_header_for_val(m.hdr, "lTurboFactor")  # across every buffer
+    [1]
+
+    Parameters
+    ----------
+    node : dict or list
+        The (sub)tree to search: typically one buffer (`protocol.Phoenix`), or the
+        whole `Protocol` to search every buffer at once.
+    *path : str
+        The trailing key chain to match, e.g. `"sFastImaging", "lTurboFactor"`.
+
+    Returns
+    -------
+    list
+        Every value found, in tree-walk order. Empty if `path` never occurs.
+    """
+    found: list = []
+
+    def _walk(subnode, trail: tuple) -> None:
+        if isinstance(subnode, dict):
+            for key, value in subnode.items():
+                new_trail = (*trail, key)
+                if new_trail[-len(path) :] == path:
+                    found.append(value)
+                _walk(value, new_trail)
+        elif isinstance(subnode, list):
+            # List indices are not part of the searched path: walk each element
+            # under the same trail, but don't re-test it -- it was already tested
+            # (or not) when this trail was built from the enclosing dict key.
+            for item in subnode:
+                _walk(item, trail)
+
+    _walk(node, ())
+    return found
 
 
 def _parse_buffer(buffer: str) -> dict:

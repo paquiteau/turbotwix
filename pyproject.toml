@@ -1,6 +1,6 @@
 [project]
 name = "turbotwix"
-version = "0.1.2"
+version = "0.2.0"
 description = "High-throughput reader for Siemens MRI raw data (.dat / TWIX) files"
 readme = "README.md"
 license = "MIT"

@@ -42,11 +42,13 @@ from .dtypes import (
 from .header import (
     AttrDict,
     Protocol,
+    search_header_for_val,
 )
 from .pmu import Pmu
 
 __all__ = [
     "COUNTERS",
+    "AttrDict",
     "Flag",
     "LineTable",
     "Measurement",
@@ -58,4 +60,5 @@ __all__ = [
     "UnsupportedLayoutError",
     "UnsupportedVersionError",
     "open_twix",
+    "search_header_for_val",
 ]

@@ -72,6 +72,23 @@ f.hdr.Meas.alTR[0]
 f.scan.protocol_name, f.scan.patient_name
 ```
 
+A tuple indexes as a nested path in one step, `.get` is path-aware too, and
+`search_header_for_val` finds a key wherever it sits in the tree (an exact, structural
+walk -- not pymapvbvd's regex/substring scan over a flattened namespace):
+
+```python
+f.hdr.Phoenix["sSliceArray", "asSlice", 0, "dThickness"]
+f.hdr.Phoenix.get(("sKSpace", "lPartitions"), default=1)
+tw.search_header_for_val(f.hdr.Phoenix, "sFastImaging", "lTurboFactor")
+```
+
+Grid-size counters (`NLin`, `NPar`, ...) are available on any line selection, computed
+and cached on first access:
+
+```python
+f.lines.image.NLin, f.lines.image.NCha  # 44, 4
+```
+
 You can also use a context manager if you want:
 
 ```python

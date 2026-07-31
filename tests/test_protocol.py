@@ -1,3 +1,5 @@
+import pytest
+
 import turbotwix as tw
 
 
@@ -108,3 +110,39 @@ def test_attrdict_attribute_access(gre_path):
     prot = _parse(gre_path)
     assert prot.MeasYaps is prot["MeasYaps"]
     assert isinstance(prot.MeasYaps, tw.AttrDict)
+
+
+def test_attrdict_tuple_path_getitem(gre_path):
+    my = _parse(gre_path).MeasYaps
+    path = ("sSliceArray", "asSlice", 0, "dThickness")
+    assert my[path] == my["sSliceArray"]["asSlice"][0]["dThickness"]
+    with pytest.raises(KeyError):
+        my["sSliceArray", "asSlice", 0, "doesNotExist"]
+    with pytest.raises(IndexError):
+        my["sSliceArray", "asSlice", 99, "dThickness"]
+
+
+def test_attrdict_get_accepts_plain_and_tuple_keys(gre_path):
+    my = _parse(gre_path).MeasYaps
+    assert my.get("sSliceArray") is my["sSliceArray"]
+    assert my.get(("sSliceArray", "asSlice", 0, "dThickness")) == 4.0
+    assert my.get(("sSliceArray", "nope"), "default") == "default"
+    assert my.get("nope", "default") == "default"
+
+
+def test_search_header_for_val_matches_a_trailing_path(gre_path):
+    ph = _parse(gre_path).Phoenix
+    assert tw.search_header_for_val(ph, "alTR") == [[10000]]
+    assert tw.search_header_for_val(ph, "sKSpace", "lBaseResolution") == [160]
+    assert tw.search_header_for_val(ph, "doesNotExist") == []
+    # A bare leaf name also matches nested arbitrarily deep, and across buffers when
+    # searching the whole protocol rather than a single one.
+    found = tw.search_header_for_val(_parse(gre_path), "lBaseResolution")
+    assert found and all(v == 160 for v in found)
+
+
+def test_search_header_for_val_does_not_double_count_through_lists(gre_path):
+    # A regression check: descending into a matched list must not re-test (and
+    # re-append) the same already-satisfied trailing path once per list element.
+    ph = _parse(gre_path).Phoenix
+    assert len(tw.search_header_for_val(ph, "alTR")) == 1

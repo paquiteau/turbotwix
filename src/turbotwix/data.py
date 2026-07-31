@@ -77,6 +77,11 @@ _NOT_PLAIN_REFERENCE = (
     | Flag.HPFEEDBACK
 )
 
+#: `NLin`, `NPar`, ... : the pymapvbvd-style grid-extent attribute name for each
+#: counter, dispatched dynamically in `LineTable.__getattr__` rather than declared one
+#: by one.
+_N_COUNTER_ATTRS = {f"N{name}": name for name in COUNTERS}
+
 
 class RowShape(NamedTuple):
     """The `(ncha, ncol)` shape of one line."""
@@ -527,10 +532,20 @@ class LineTable:
     def __getattr__(self, name: str):
         if name in ["offset", "flags", "ncol", "ncha", "counters"]:
             return self.rows[name]
+        if name == "NCha":
+            value = self.row_shape.ncha
+        elif name == "NCol":
+            value = self.row_shape.ncol
+        elif name in _N_COUNTER_ATTRS:
+            value = self.size(_N_COUNTER_ATTRS[name])
         else:
             raise AttributeError(
                 f"{type(self).__name__!r} object has no attribute {name!r}"
             )
+        # Cache like `functools.cached_property` would: next lookup finds it in
+        # `__dict__` directly, without coming back through `__getattr__`.
+        self.__dict__[name] = value
+        return value
 
     def counter(self, name: str) -> np.ndarray:
         """One loop counter's value for every line.
@@ -546,6 +561,20 @@ class LineTable:
             The `(N,)` int64 counter values.
         """
         return self.rows["counters"][name].astype(np.int64)
+
+    def size(self, name: str) -> int:
+        """Grid extent of one loop counter: `max - min + 1`, its declared axis size.
+
+        This is what pymapvbvd exposes as e.g. ``twixObj.image.NLin`` -- also
+        reachable here as the dynamic, cached attribute `NLin` (one such attribute
+        per name in `COUNTERS`, plus `NCha`/`NCol` from `row_shape`). Unlike
+        `counter`, which hands back the raw per-line values, this is a single count;
+        0 for an empty table.
+        """
+        if len(self) == 0:
+            return 0
+        values = self.counter(name)
+        return int(values.max() - values.min() + 1)
 
     @functools.cached_property
     def row_shape(self) -> RowShape:

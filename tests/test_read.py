@@ -167,6 +167,26 @@ def test_flags_and_counters(gre_path):
     assert lines.counters["Lin"].tolist() == lines.counter("Lin").tolist()
 
 
+def test_grid_size_and_dynamic_n_attrs(gre_path):
+    mm, table, expected = build([(4, 2, 0, 0), (4, 2, 0, 0), (4, 2, 0, 0)])
+    lines = tw.LineTable(table, mm, VD)
+    assert lines.size("Lin") == 3
+    assert lines.size("Sli") == 1  # never set, so min == max == 0
+    assert lines.NLin == 3
+    assert lines.NCha == 2
+    assert lines.NCol == 4
+    # cached like a cached_property: second access hits __dict__, not __getattr__
+    assert lines.__dict__["NLin"] == 3
+
+    empty = lines[:0]
+    assert len(empty) == 0
+    assert empty.size("Lin") == 0
+
+    img = tw.open_twix(gre_path)[-1].lines.image
+    assert img.NLin == 160
+    assert img.NSli == 1
+
+
 def test_read_returns_lines_not_a_hypercube(gre_path):
     m = tw.open_twix(gre_path)[-1]
     lines = m.lines.image
