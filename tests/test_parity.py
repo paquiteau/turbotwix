@@ -46,7 +46,7 @@ def test_parity_twixtools_image_line_counts(gre_path, epi_path):
 
 @pytest.mark.skipif(not HAS_PYMAPVBVD, reason="pymapvbvd not installed")
 def test_parity_pymapvbvd_dense_image(gre_path):
-    """`to_dense` must reproduce pymapvbvd's k-space array (modulo its axis order)."""
+    """`read(dims=...)` must reproduce pymapvbvd's k-space array (modulo axis order)."""
     import mapvbvd
 
     ref_scan = mapvbvd.mapVBVD(gre_path, quiet=True)
@@ -57,6 +57,6 @@ def test_parity_pymapvbvd_dense_image(gre_path):
     ref = np.squeeze(ref_scan.image[tuple([slice(None)] * 16)])  # (Col, Cha, Lin)
 
     m = tw.open_twix(gre_path)[-1]
-    got = m.to_dense(dims=("Lin",))  # (Lin, Cha, Col)
+    got = m.read(dims=("Lin",))  # (Lin, Cha, Col)
 
     np.testing.assert_array_equal(got.transpose(2, 1, 0), ref)

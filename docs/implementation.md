@@ -3,9 +3,9 @@
 Why the reader is shaped the way it is, and where the speed comes from. For the on-disk
 format itself see [`twix-format.md`](twix-format.md); for the API see the README.
 
-Everything lives in `src/turbotwix/__init__.py`, in the order a file is read: binary
-layout, the eval-info mask, the text protocol, the line table, sample extraction, the
-object model.
+The code is split by the order a file is read: `dtypes.py` (binary layout, the eval-info
+mask), `header.py` (the text protocol), `data.py` (the line table, sample extraction, and
+the object model). `__init__.py` just re-exports.
 
 ## The invariant, and the one requirement that is not one
 
@@ -21,7 +21,7 @@ common and legitimate: an embedded parallel-imaging reference scan is Cartesian 
 where the imaging lines are spiral and long, and a coil-sensitivity adjustment stores
 body-coil (`ncha=2`) and array-coil (`ncha=44`) lines together. Refusing the file over that
 would refuse data that is perfectly readable line by line, so `LINE_DTYPE` carries each
-line's own shape and the table stays whole. `read_lines` is where the requirement actually
+line's own shape and the table stays whole. `LineTable.read` is where the requirement actually
 bites, because its result is one `(n_lines, ncha, ncol)` array; it calls `common_shape`,
 which raises `UnsupportedLayoutError` naming the shapes present. A selection
 (`.image`, `.refscan`, `.noise`) is the fix, and is what the caller wanted anyway.
@@ -133,7 +133,7 @@ Python's `int()`/`float()` accept `_` as a digit separator: the scanner ID
 
 ## Grid folding
 
-`to_dense` is never implicit. `_varying_counters` gives the counters that are not constant
+`read(dims=...)` is never implicit. `_varying_counters` gives the counters that are not constant
 over a selection (min ≠ max — two reductions, not a sort), and is never empty: with nothing
 varying there is no grid at all, and `("Lin",)` gives a degenerate size-1 axis instead of a
 rank-0 one.
@@ -169,14 +169,14 @@ are pessimistic:
 | library | time (s) | peak RSS (MB) |
 |---|---|---|
 | turbotwix (lines) | **0.52** | 2071 |
-| turbotwix (+ `to_dense`) | 0.80 | 3087 |
+| turbotwix (+ `read(dims=...)`) | 0.80 | 3087 |
 | pymapvbvd | 3.13 | 602 |
 | twixtools | 2.21 | 1181 |
 
 Peak RSS is higher than the references mostly because it counts mmap-resident file pages —
 read-only, file-backed, trivially evictable under pressure — on top of the output array.
 
-The `to_dense` row shows what the dense hypercube costs when you actually want it: 1 GB more
+The `read(dims=...)` row shows what the dense hypercube costs when you actually want it: 1 GB more
 memory and 50% more time, on data that is *densely* sampled. For undersampled or
 non-Cartesian data the gap widens with the sampling ratio.
 

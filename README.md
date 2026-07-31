@@ -15,7 +15,7 @@ pymapvbvd and twixtools do. For a spiral or radial acquisition those counters in
 shots, interleaves or spokes — there is no k-space grid to fold onto — and building one
 anyway costs memory proportional to the *nominal* matrix rather than the acquired data,
 forces a policy on duplicate indices, and makes partial reads impossible. Folding onto a
-grid is available when you want it (`to_dense`), never implicit.
+grid is available when you want it (`read(dims=...)`), never implicit.
 
 Line offsets must be 8-byte aligned; blocks that carry no samples (ACQEND, PMU/SYNCDATA)
 are skipped rather than returned. A measurement may mix `(ncha, ncol)` — an embedded
@@ -42,7 +42,7 @@ len(lines.image), lines.shape  # 4800, (44, 15000)
 samples = f.read(lines.image)  # (4800, 44, 15000) complex64
 ```
 
-`f.lines`, `f.hdr`, `f.read` and `f.to_dense` act on **the last measurement** (`f.scan`),
+`f.lines`, `f.hdr` and `f.read` act on **the last measurement** (`f.scan`),
 which is the scan itself — the measurements before it are the adjustments it needed. The
 others are still there, by index or by iteration:
 
@@ -97,22 +97,22 @@ with tw.open_twix("meas.dat") as f:
 ### Cartesian data
 
 ```python
-dense = f.to_dense(dims=("Lin", "Par"))  # (Lin, Par, Cha, Col)
+dense = f.read(dims=("Lin", "Par"))  # (Lin, Par, Cha, Col)
 ```
 
-`to_dense` raises if several lines land on the same grid position — that normally means a
-counter is missing from `dims`, not that the data wants averaging — and names the counters
-responsible. `dims="minimal"` picks the axes for you: the counters that vary, minus those
-the others already determine (`minimal_dims`). That packs the grid, at the cost of an axis
-you may have wanted to slice on, so naming the dims yourself keeps both the rank and the
-memory predictable.
+`read(dims=...)` raises if several lines land on the same grid position — that normally
+means a counter is missing from `dims`, not that the data wants averaging — and names the
+counters responsible. `dims="minimal"` picks the axes for you: the counters that vary,
+minus those the others already determine (`minimal_dims`). That packs the grid, at the
+cost of an axis you may have wanted to slice on, so naming the dims yourself keeps both the
+rank and the memory predictable.
 
 ## Correctness
 
 `tests/test_parity.py` checks the extracted samples against pymapvbvd and twixtools:
-line for line and sample for sample against twixtools' `mdb.data`, and `to_dense` against
-pymapvbvd's k-space array. Install the references with `uv sync --group parity`; the tests
-skip otherwise.
+line for line and sample for sample against twixtools' `mdb.data`, and `read(dims=...)`
+against pymapvbvd's k-space array. Install the references with `uv sync --group parity`;
+the tests skip otherwise.
 
 ## Performance
 

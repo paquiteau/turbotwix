@@ -18,7 +18,7 @@ VD = tw.TwixVersion.VD
 
 def test_read_lines_returns_file_order_samples():
     mm, table, expected = build([(4, 2, 100, 0), (4, 2, 200, 0), (4, 2, 300, 0)])
-    got = tw.read_lines(mm, table, VD)
+    got = tw.LineTable(table, mm, VD).read()
     assert got.shape == (3, 2, 4)
     assert got.dtype == np.complex64
     np.testing.assert_array_equal(got, np.stack(expected))
@@ -26,12 +26,11 @@ def test_read_lines_returns_file_order_samples():
 
 def test_read_lines_unreflects_by_default():
     mm, table, expected = build([(4, 2, 100, 0), (4, 2, 200, int(Flag.REFLECT))])
+    lines = tw.LineTable(table, mm, VD)
     np.testing.assert_array_equal(
-        tw.read_lines(mm, table, VD), np.stack([expected[0], expected[1][:, ::-1]])
+        lines.read(), np.stack([expected[0], expected[1][:, ::-1]])
     )
-    np.testing.assert_array_equal(
-        tw.read_lines(mm, table, VD, reflect=False), np.stack(expected)
-    )
+    np.testing.assert_array_equal(lines.read(reflect=False), np.stack(expected))
 
 
 def test_read_lines_unreflects_in_bounded_chunks(monkeypatch):
@@ -39,35 +38,37 @@ def test_read_lines_unreflects_in_bounded_chunks(monkeypatch):
     mm, table, expected = build(
         [(4, 2, 100 * k, int(Flag.REFLECT) * (k % 2)) for k in range(9)]
     )
-    monkeypatch.setattr(tw, "_FLIP_BUDGET_BYTES", 1)
+    monkeypatch.setattr(tw.data, "_FLIP_BUDGET_BYTES", 1)
     np.testing.assert_array_equal(
-        tw.read_lines(mm, table, VD),
+        tw.LineTable(table, mm, VD).read(),
         np.stack([d[:, ::-1] if k % 2 else d for k, d in enumerate(expected)]),
     )
 
 
 def test_read_lines_into_caller_buffer():
     mm, table, expected = build([(4, 2, 100, 0), (4, 2, 200, 0)])
+    lines = tw.LineTable(table, mm, VD)
     out = np.zeros((2, 2, 4), dtype=np.complex64)
-    assert tw.read_lines(mm, table, VD, out=out) is out
+    assert lines.read(out=out) is out
     np.testing.assert_array_equal(out, np.stack(expected))
 
     with pytest.raises(ValueError, match="out must be"):
-        tw.read_lines(mm, table, VD, out=np.zeros((2, 2, 4), dtype=np.complex128))
+        lines.read(out=np.zeros((2, 2, 4), dtype=np.complex128))
 
 
 def test_read_lines_empty_selection():
     mm, table, _ = build([(4, 2, 100, 0)])
-    assert tw.read_lines(mm, table[:0], VD).shape == (0, 0, 0)
+    assert tw.LineTable(table, mm, VD)[:0].read().shape == (0, 0, 0)
 
 
 def test_read_lines_irregularly_spaced_selection():
     # A selection with uneven gaps cannot be one strided view, so it takes the per-line
     # path; the samples must be identical either way.
     mm, table, expected = build([(4, 2, 100 * k, 0) for k in range(6)])
+    lines = tw.LineTable(table, mm, VD)
     for picked in ([0, 1, 2], [0, 1, 3], [5, 0], [2]):
         np.testing.assert_array_equal(
-            tw.read_lines(mm, table[picked], VD),
+            lines[picked].read(),
             np.stack([expected[i] for i in picked]),
         )
 
@@ -113,13 +114,13 @@ def test_selections_compose_and_stay_line_tables(epi_path):
     assert m.lines[:0].shape == (0, 0)
 
 
-# --- to_dense -------------------------------------------------------------
+# --- read(dims=...) --------------------------------------------------------
 
 
-def test_to_dense_folds_onto_chosen_counters(gre_path):
+def test_read_dims_folds_onto_chosen_counters(gre_path):
     m = tw.open_twix(gre_path)[-1]
     samples = m.read(m.lines.image)
-    dense = m.to_dense(dims=("Lin",))
+    dense = m.read(dims=("Lin",))
     assert dense.shape == (160, 2, 320)
     np.testing.assert_array_equal(dense[5], samples[5])
 
@@ -135,10 +136,9 @@ def test_minimal_dims_keeps_genuinely_independent_counters():
 
     assert tw._varying_counters(lines) == ("Ave", "Seg")
     assert tw.minimal_dims(lines) == ("Ave", "Seg")
-    dims, flat, sizes, minimal = tw._fold_index(lines, "minimal")
-    assert minimal
+    dims, flat, sizes = tw._fold_index(lines, "minimal")  # no raise
+    assert dims == ("Ave", "Seg")
     assert tuple(sizes) == (2, 2)
-    tw._check_no_collisions(lines, dims, flat, int(np.prod(sizes)), minimal)  # no raise
 
 
 # --- the object model on real files ---------------------------------------

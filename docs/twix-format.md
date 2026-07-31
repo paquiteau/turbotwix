@@ -1,7 +1,7 @@
 # The Siemens TWIX (`.dat`) raw-data format
 
 What a Siemens MRI raw-data file actually contains, at the byte level, as implemented in
-this repository (all of it in `src/turbotwix/__init__.py`).
+this repository (mainly `src/turbotwix/dtypes.py` and `src/turbotwix/header.py`).
 Everything below is little-endian; all structures are unpadded/packed.
 
 The format is undocumented by the vendor. This description was re-derived from the
@@ -269,7 +269,7 @@ free `Id*` counters a sequence may use as it likes.
 
 These are *labels the sequence wrote*, not k-space coordinates. On a Cartesian scan
 `(Lin, Par)` do index the grid, and folding the lines onto a dense array indexed by
-counters is meaningful (`to_dense`). On a spiral or radial acquisition the same counters
+counters is meaningful (`read(dims=...)`). On a spiral or radial acquisition the same counters
 index shots, interleaves or spokes and there is no grid to fold onto — which is why
 turbotwix keeps the line list as the primary model and treats gridding as opt-in. Note
 also that `Lin` values are the *nominal* matrix indices: an undersampled or

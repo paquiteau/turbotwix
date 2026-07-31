@@ -33,7 +33,7 @@ _READ_CODE = {
         "logging.getLogger('turbotwix').setLevel(logging.DEBUG)\n"
         "import turbotwix as tw\n"
         "m = tw.open_twix(path)[-1]\n"
-        "m.to_dense(m.lines.image, ('Lin', 'Rep'))\n"
+        "m.read(m.lines.image, ('Lin', 'Rep'))\n"
     ),
     "pymapvbvd": (
         "import mapvbvd\n"

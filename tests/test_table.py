@@ -85,12 +85,13 @@ def test_a_change_of_shape_is_tabled_and_refused_only_at_read(interrupted):
     assert table["ncol"].tolist() == [4, 4, 4, 6]
     assert table["ncha"].tolist() == [2, 2, 2, 1]
 
+    lines_table = tw.LineTable(table, mm, tw.TwixVersion.VD)
     with pytest.raises(tw.UnsupportedLayoutError, match="mix shapes"):
-        tw.read_lines(mm, table, tw.TwixVersion.VD)
+        lines_table.read()
 
     # Either single-shaped subset reads on its own.
-    assert tw.read_lines(mm, table[:3], tw.TwixVersion.VD).shape == (3, 2, 4)
-    assert tw.read_lines(mm, table[3:], tw.TwixVersion.VD).shape == (1, 1, 6)
+    assert lines_table[:3].read().shape == (3, 2, 4)
+    assert lines_table[3:].read().shape == (1, 1, 6)
 
 
 def test_a_mixed_line_table_reports_its_shapes():
