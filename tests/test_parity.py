@@ -28,10 +28,11 @@ def test_parity_twixtools_per_line_samples(dataset, request):
     ref = np.stack([mdb.data for mdb in scan["mdb"] if mdb.is_image_scan()])
 
     m = tw.open_twix(path)[-1]
+    # turbotwix: (Cha, n, Col); twixtools: (n, Cha, Col)
     got = m.read(m.lines.image, reflect=False)
 
-    assert got.shape == ref.shape
-    np.testing.assert_array_equal(got, ref)
+    assert got.shape == ref.transpose(1, 0, 2).shape
+    np.testing.assert_array_equal(got, ref.transpose(1, 0, 2))
 
 
 @pytest.mark.skipif(not HAS_TWIXTOOLS, reason="twixtools not installed")
@@ -57,6 +58,6 @@ def test_parity_pymapvbvd_dense_image(gre_path):
     ref = np.squeeze(ref_scan.image[tuple([slice(None)] * 16)])  # (Col, Cha, Lin)
 
     m = tw.open_twix(gre_path)[-1]
-    got = m.read(dims=("Lin",))  # (Lin, Cha, Col)
+    got = m.read(dims=("Lin",))  # (Cha, Lin, Col)
 
-    np.testing.assert_array_equal(got.transpose(2, 1, 0), ref)
+    np.testing.assert_array_equal(got.transpose(2, 0, 1), ref)

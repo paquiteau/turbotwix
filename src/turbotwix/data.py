@@ -446,7 +446,7 @@ def common_shape(table: np.ndarray) -> RowShape:
         )
         raise UnsupportedLayoutError(
             f"these lines mix shapes: {listed}. A read returns one "
-            f"(n_lines, ncha, ncol) array, so select a single-shaped subset first — "
+            f"(ncha, n_lines, ncol) array, so select a single-shaped subset first — "
             f"e.g. .image, .refscan or .noise."
         )
     return RowShape(ncha, ncol)
@@ -575,7 +575,16 @@ class LineTable:
         dest: np.ndarray | None = None,
         dims: tuple[str, ...] | Literal["minimal"] | None = None,
     ) -> np.ndarray:
-        """Read every line into a `(len(self), ncha, ncol)` array, compact or folded.
+        """Read every line into a `(ncha, len(self), ncol)` array, compact or folded.
+
+        The channel axis is first, and `ncol` stays last: each line is stored on disk
+        channel-major (all `ncol` samples of one channel contiguous, then the next
+        channel), so keeping that same relative order — channel outermost, column
+        innermost — lets every channel's run be copied as one contiguous block. Only
+        the line/grid axes move, out from between them to the front. A channel-last
+        array avoids putting channel in the middle too, but forces a strided gather
+        instead of a contiguous per-channel copy, which is markedly slower once
+        `ncha` is more than a couple of channels.
 
         Requires that every line has the same `(ncha, ncol)`.
 
@@ -583,30 +592,30 @@ class LineTable:
         ----------
         out : numpy.ndarray, optional
             Preallocated destination.
-            Without `dims`: `(len(self), ncha, ncol)` complex64 when `dest` is not
-            given (allocated if not given either); `(*, ncha, ncol)` complex64,
-            required, when `dest` is given. With `dims`: `(*dim_sizes, ncha, ncol)` or
-            the equivalent flattened `(prod(dim_sizes), ncha, ncol)`, complex64
+            Without `dims`: `(ncha, len(self), ncol)` complex64 when `dest` is not
+            given (allocated if not given either); `(ncha, *, ncol)` complex64,
+            required, when `dest` is given. With `dims`: `(ncha, *dim_sizes, ncol)` or
+            the equivalent flattened `(ncha, prod(dim_sizes), ncol)`, complex64
             (allocated, and zero-filled, if not given) — only its shape is checked
             against `dims`, so an `out` with unfilled cells is the caller's own doing.
         reflect : bool, default True
             Un-reverse the lines flagged REFLECT (bipolar readouts store them
             backwards). Pass False for the samples exactly as laid down on disk.
         dest : numpy.ndarray, optional
-            Row index into `out` for each line of `self`, in order, so a line is
-            written straight to where it belongs instead of to a compact
-            `(len(self), ...)` buffer that then has to be copied again. Requires `out`.
-            Defaults to file order (row `i` for line `i`). Not valid together with
-            `dims`, which computes its own.
+            Index into `out`'s line axis for each line of `self`, in order, so a line
+            is written straight to where it belongs instead of to a compact
+            `(ncha, len(self), ncol)` buffer that then has to be copied again.
+            Requires `out`. Defaults to file order (position `i` for line `i`). Not
+            valid together with `dims`, which computes its own.
         dims : tuple of str or str, optional
             The counter names to use as grid axes; folds onto a grid when given,
-            instead of returning the compact `(len(self), ncha, ncol)` array.
+            instead of returning the compact `(ncha, len(self), ncol)` array.
 
         Returns
         -------
         numpy.ndarray
             The samples without `dims` (`out` itself when given); the
-            `(*dim_sizes, ncha, ncol)` grid with it (`out` itself, reshaped, when
+            `(ncha, *dim_sizes, ncol)` grid with it (`out` itself, reshaped, when
             given).
 
         Raises
@@ -620,7 +629,8 @@ class LineTable:
         n = len(self.rows)
         if n == 0:
             raise ValueError("Empty Table, nothing to read.")
-        shape = (n, *self.row_shape)
+        ncha, ncol = self.row_shape
+        shape = (ncha, n, ncol)
         if out is not None and out.dtype != np.complex64:
             raise ValueError(f"out must be complex64, got {out.dtype}")
         if dims is not None and dest is not None:
@@ -628,16 +638,16 @@ class LineTable:
 
         elif dims is not None and dest is None:
             _, flat, sizes = _fold_index(self, dims)
-            grid_shape = (*sizes, *self.row_shape)
+            grid_shape = (ncha, *sizes, ncol)
             if out is None:
                 out = np.zeros(grid_shape, dtype=np.complex64)
 
         elif dims is None and dest is not None:
             if out is None:
                 raise ValueError("out is required when dest is given")
-            if out.shape[1:] != self.row_shape:
+            if out.ndim != 3 or out.shape[0] != ncha or out.shape[2] != ncol:
                 raise ValueError(
-                    f"out must be (*, {self.row_shape}) complex64, got {out.shape}"
+                    f"out must be ({ncha}, *, {ncol}) complex64, got {out.shape}"
                 )
             flat = dest
         else:  # dims and dest are both None
@@ -646,7 +656,7 @@ class LineTable:
             elif out.shape != shape:
                 raise ValueError(f"out must be {shape} complex64, got {out.shape}")
             flat = None
-        self._read_into(out.reshape(-1, *self.row_shape), flat, reflect)
+        self._read_into(out.reshape(ncha, -1, ncol), flat, reflect)
         return out
 
     def _read_into(
@@ -662,16 +672,20 @@ class LineTable:
         caller's responsibility, validated.
         """
         n = len(self.rows)
-        logger.debug("%d lines, %s samples each", n, self.row_shape)
+        ncha, ncol = self.row_shape
+        logger.debug("%d lines, (%d, %d) samples each", n, ncha, ncol)
         prefix, chan_hdr = HEADER_SIZES[self._version]
         # size for a single channel: its header, then its samples
-        chan_block_size = chan_hdr + 8 * self.row_shape.ncol
+        chan_block_size = chan_hdr + 8 * ncol
         # The whole file as a complex64 array, ignoring any trailing bytes.
         c8 = np.asarray(self._mm[: (self._mm.size // 8) * 8].view("<c8"))
         # The byte offset of each line's first sample, as an index into `c8`.
 
         starts = (self.rows["offset"].astype(np.int64) + prefix + chan_hdr) // 8
 
+        # `out` is (ncha, ..., ncol): channel first, column last, same relative order
+        # as on disk (channel-major, ncol contiguous per channel) — so every channel's
+        # run copies as one contiguous block instead of a strided gather.
         # Try to do a strided copy of the whole selection at once when the
         # offsets are evenly spaced.
         # Otherwise, fall back to copy each line one by one.
@@ -679,13 +693,13 @@ class LineTable:
         if step > 0 and np.all(np.diff(starts) == step):
             view = as_strided(
                 c8[int(starts[0]) :],
-                shape=(n, *self.row_shape),
-                strides=(8 * step, chan_block_size, 8),
+                shape=(ncha, n, ncol),
+                strides=(chan_block_size, 8 * step, 8),
             )
             if dest is None:
                 np.copyto(out, view)
             else:
-                out[dest] = view
+                out[:, dest, :] = view
         else:
             logger.debug("%d irregularly-spaced lines, reading one by one", n)
             iterator = enumerate(starts)
@@ -694,8 +708,8 @@ class LineTable:
             if tqdm is not None:
                 iterator = tqdm(iterator, unit="line", desc="turbotwix: reading lines")
             for i, start in iterator:
-                out[dest[i]] = as_strided(
-                    c8[int(start) :], shape=self.row_shape, strides=(chan_block_size, 8)
+                out[:, dest[i], :] = as_strided(
+                    c8[int(start) :], shape=(ncha, ncol), strides=(chan_block_size, 8)
                 )
         # Apply reflect Flag: the samples are stored backwards on disk, so flip
         # them to the right order. Data is chunked to avoid creating a temporary
@@ -704,10 +718,10 @@ class LineTable:
             idx = np.flatnonzero(self.has_flag(Flag.REFLECT))
             if dest is not None:
                 idx = dest[idx]
-            chunk = max(1, _FLIP_BUDGET_BYTES // (8 * np.prod(self.row_shape)))
+            chunk = max(1, _FLIP_BUDGET_BYTES // (8 * ncha * ncol))
             for at in range(0, idx.size, chunk):
                 picked = idx[at : at + chunk]
-                out[picked] = out[picked][:, :, ::-1]
+                out[:, picked, :] = out[:, picked, :][:, :, ::-1]
 
     def has_flag(self, flag: Flag) -> np.ndarray:
         """Boolean mask of lines carrying *all* bits of `flag`.

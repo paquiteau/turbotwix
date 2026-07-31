@@ -19,18 +19,18 @@ VD = tw.TwixVersion.VD
 def test_read_lines_returns_file_order_samples():
     mm, table, expected = build([(4, 2, 100, 0), (4, 2, 200, 0), (4, 2, 300, 0)])
     got = tw.LineTable(table, mm, VD).read()
-    assert got.shape == (3, 2, 4)
+    assert got.shape == (2, 3, 4)
     assert got.dtype == np.complex64
-    np.testing.assert_array_equal(got, np.stack(expected))
+    np.testing.assert_array_equal(got, np.stack(expected, axis=1))
 
 
 def test_read_lines_unreflects_by_default():
     mm, table, expected = build([(4, 2, 100, 0), (4, 2, 200, int(Flag.REFLECT))])
     lines = tw.LineTable(table, mm, VD)
     np.testing.assert_array_equal(
-        lines.read(), np.stack([expected[0], expected[1][:, ::-1]])
+        lines.read(), np.stack([expected[0], expected[1][:, ::-1]], axis=1)
     )
-    np.testing.assert_array_equal(lines.read(reflect=False), np.stack(expected))
+    np.testing.assert_array_equal(lines.read(reflect=False), np.stack(expected, axis=1))
 
 
 def test_read_lines_unreflects_in_bounded_chunks(monkeypatch):
@@ -41,7 +41,7 @@ def test_read_lines_unreflects_in_bounded_chunks(monkeypatch):
     monkeypatch.setattr(tw.data, "_FLIP_BUDGET_BYTES", 1)
     np.testing.assert_array_equal(
         tw.LineTable(table, mm, VD).read(),
-        np.stack([d[:, ::-1] if k % 2 else d for k, d in enumerate(expected)]),
+        np.stack([d[:, ::-1] if k % 2 else d for k, d in enumerate(expected)], axis=1),
     )
 
 
@@ -50,7 +50,7 @@ def test_read_lines_into_caller_buffer():
     lines = tw.LineTable(table, mm, VD)
     out = np.zeros((2, 2, 4), dtype=np.complex64)
     assert lines.read(out=out) is out
-    np.testing.assert_array_equal(out, np.stack(expected))
+    np.testing.assert_array_equal(out, np.stack(expected, axis=1))
 
     with pytest.raises(ValueError, match="out must be"):
         lines.read(out=np.zeros((2, 2, 4), dtype=np.complex128))
@@ -70,7 +70,7 @@ def test_read_lines_irregularly_spaced_selection():
     for picked in ([0, 1, 2], [0, 1, 3], [5, 0], [2]):
         np.testing.assert_array_equal(
             lines[picked].read(),
-            np.stack([expected[i] for i in picked]),
+            np.stack([expected[i] for i in picked], axis=1),
         )
 
 
@@ -122,8 +122,8 @@ def test_read_dims_folds_onto_chosen_counters(gre_path):
     m = tw.open_twix(gre_path)[-1]
     samples = m.read(m.lines.image)
     dense = m.read(dims=("Lin",))
-    assert dense.shape == (160, 2, 320)
-    np.testing.assert_array_equal(dense[5], samples[5])
+    assert dense.shape == (2, 160, 320)
+    np.testing.assert_array_equal(dense[:, 5], samples[:, 5])
 
 
 def test_minimal_dims_keeps_genuinely_independent_counters():
@@ -170,11 +170,11 @@ def test_read_returns_lines_not_a_hypercube(gre_path):
     m = tw.open_twix(gre_path)[-1]
     lines = m.lines.image
     samples = m.read(lines)
-    assert samples.shape == (len(lines), 2, 320)
+    assert samples.shape == (2, len(lines), 320)
     assert samples.dtype == np.complex64
 
     # Partial read: only the requested lines are touched.
-    np.testing.assert_array_equal(m.read(lines[10:20]), samples[10:20])
+    np.testing.assert_array_equal(m.read(lines[10:20]), samples[:, 10:20])
     # No selection means every line of the measurement.
     np.testing.assert_array_equal(m.read(), samples)
 
@@ -183,7 +183,7 @@ def test_read_into_preallocated_buffer(gre_path, tmp_path):
     m = tw.open_twix(gre_path)[-1]
     lines = m.lines.image
     dst = np.memmap(
-        tmp_path / "out.dat", dtype=np.complex64, mode="w+", shape=(len(lines), 2, 320)
+        tmp_path / "out.dat", dtype=np.complex64, mode="w+", shape=(2, len(lines), 320)
     )
     m.read(lines, out=dst)
     np.testing.assert_array_equal(np.asarray(dst), m.read(lines))
@@ -204,7 +204,7 @@ def _truncated_copy(src: str, dst: pathlib.Path) -> str:
     version = tw.dtypes.detect_version(mm)
     entry = tw.dtypes.parse_raid_directory(mm, version)[-1]
     _, hdr_len = tw.header.parse_protocol(mm, entry.offset)
-    table, _ = tw.data.build_table(
+    table, _, _ = tw.data.build_table(
         mm, entry.offset + hdr_len, entry.offset + entry.length, version
     )
     stride = int(table["offset"][1] - table["offset"][0])

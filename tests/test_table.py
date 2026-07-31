@@ -43,22 +43,26 @@ def test_uniform_run_declines_on_a_broken_scan_counter():
 
 def test_walk_skips_interleaved_syncdata():
     # The non-Cartesian layout: image lines with a sideband block between them. The
-    # uniform-run hypothesis fails, the walk handles it, and the sync blocks are stepped
-    # over rather than recorded.
-    raw, counter, offsets = b"", 1, []
+    # uniform-run hypothesis fails, the walk handles it, stepping over the sync blocks
+    # but recording their (offset, length) for later PMU decoding.
+    raw, counter, offsets, sync_offsets = b"", 1, [], []
     for i in range(6):
         offsets.append(len(raw))
         raw += line(4, 2, counter=counter, lin=i)[0]
         counter += 1
         if i % 2:
+            sync_offsets.append(len(raw))
             raw += sync(256, counter)
             counter += 1
 
-    _, table, truncated = table_of(raw + acqend(counter))
+    mm = np.frombuffer(raw + acqend(counter), dtype=np.uint8)
+    table, syncdata, truncated = tw.data.build_table(mm, 0, mm.size, tw.TwixVersion.VD)
     assert not truncated
     assert table["offset"].tolist() == offsets
     assert table["counters"]["Lin"].tolist() == list(range(6))
     assert sorted(set(np.diff(table["offset"]).tolist())) == [STRIDE, STRIDE + 256]
+    assert syncdata["offset"].tolist() == sync_offsets
+    assert syncdata["length"].tolist() == [256] * len(sync_offsets)
 
 
 def test_walk_handles_a_non_adc_first_block():
@@ -99,7 +103,7 @@ def test_a_change_of_shape_is_tabled_and_refused_only_at_read(interrupted):
         lines_table.read()
 
     # Either single-shaped subset reads on its own.
-    assert lines_table[:3].read().shape == (3, 2, 4)
+    assert lines_table[:3].read().shape == (2, 3, 4)
     assert lines_table[3:].read().shape == (1, 1, 6)
 
 

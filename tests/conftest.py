@@ -21,7 +21,11 @@ def epi_path() -> str:
 def line(
     ncol: int, ncha: int, flags: int = 0, counter: int = 1, lin: int = 0, base: float | None = None
 ) -> tuple[bytes, np.ndarray]:
-    """One synthetic VD line; its samples carry recognisable values if `base` is given."""
+    """One synthetic VD line; its samples carry recognisable values if `base` is given.
+
+    The returned array is `(ncha, ncol)`, matching both the on-disk channel-major
+    order and `LineTable.read`'s per-line axes.
+    """
     header = np.zeros(1, dtype=tw.dtypes.VD_SCAN_HEADER)[0]
     header["SamplesInScan"] = ncol
     header["UsedChannels"] = ncha
@@ -61,7 +65,7 @@ def sync(length: int, counter: int = 1) -> bytes:
 def table_of(raw: bytes) -> tuple[np.ndarray, np.ndarray, bool]:
     """`(mm, table, truncated)` for a raw synthetic VD stream."""
     mm = np.frombuffer(raw, dtype=np.uint8)
-    rows, truncated = tw.data.build_table(mm, 0, mm.size, tw.TwixVersion.VD)
+    rows, _, truncated = tw.data.build_table(mm, 0, mm.size, tw.TwixVersion.VD)
     return mm, rows, truncated
 
 
