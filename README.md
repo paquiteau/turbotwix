@@ -1,30 +1,20 @@
 # turbotwix
 
-A from-scratch, opinionated, very fast reader for Siemens MRI raw data (`.dat` / TWIX)
-files. Reads VB and VD/VE. It does not implement PMU decoding, slice-geometry parsing, or
-ramp-sampling regridding.
+A fast, and opiniated, Siemens TWIX (`.dat`, VB and VD/VE) reader. 
 
-## The data model
+- 6x faster than pymapvbvd on a full Cartesian read, and able to pull a single shot out of a
+24 GiB file in a couple of milliseconds without ever loading the rest.
+- Use modern python (type annotations) and numpy structured dtype array.
+- NB: It does not implement slice-geometry parsing or ramp-sampling regridding.
 
-A TWIX measurement is a **list of acquisition lines**, each with metadata and a
-`(ncha, ncol)` block of samples. turbotwix hands you exactly that: a queryable line
-table, and reads that return `(n_lines, ncha, ncol)`.
 
-It does *not* return a dense array indexed by the 14 loop counters, which is what
-pymapvbvd and twixtools do. For a spiral or radial acquisition those counters index
-shots, interleaves or spokes — there is no k-space grid to fold onto — and building one
-anyway costs memory proportional to the *nominal* matrix rather than the acquired data,
-forces a policy on duplicate indices, and makes partial reads impossible. Folding onto a
-grid is available when you want it (`read(dims=...)`), never implicit.
+### Disclosure
+This library is not affiliated with Siemens, and the TWIX format is not documented by them. The format has been reverse-engineered from the files and the existing implementations: 
 
-Line offsets must be 8-byte aligned; blocks that carry no samples (ACQEND, PMU/SYNCDATA)
-are skipped rather than returned. A measurement may mix `(ncha, ncol)` — an embedded
-parallel-imaging reference scan is short and Cartesian where the imaging lines are long,
-and a coil-sensitivity adjustment stores body-coil (`ncha=2`) and array-coil (`ncha=44`)
-lines together — and the table holds those lines all the same. Only a *read* needs one
-shape, since its result is one `(n_lines, ncha, ncol)` array, so reading such a
-measurement means selecting first (`lines.image`, `lines.refscan`); asking for the mixed
-set raises `UnsupportedLayoutError`.
+- [pymapvbvd](https://github.com/pehses/mapVBVD)
+- [twixtools](https://github.com/pehses/twixtools),  
+
+Without them, turbotwix would not exists. 
 
 ## Usage
 
@@ -43,8 +33,7 @@ samples = f.read(lines.image)  # (4800, 44, 15000) complex64
 ```
 
 `f.lines`, `f.hdr` and `f.read` act on **the last measurement** (`f.scan`),
-which is the scan itself — the measurements before it are the adjustments it needed. The
-others are still there, by index or by iteration:
+which is the scan itself, the  measurements before it are usually calibration data you don't necessary need. They are still there, by index or by iteration:
 
 ```python
 len(f)  # 2
@@ -53,7 +42,7 @@ noise = f[0].lines.noise  # a calibration measurement, explicitly
 ```
 
 Selections are boolean queries and compose, so a partial read is just a smaller
-selection — nothing else is touched on disk:
+selection.  Nothing else is touched on disk:
 
 ```python
 img = f.lines.image
@@ -66,8 +55,7 @@ lines.image.headers()  # full scan headers on demand: SliceData,
 # IceProgramPara, timestamps, centre indices
 ```
 
-Read into your own buffer to bound memory on files that do not fit in RAM — the copy goes
-straight from the mapped file into it, with no intermediate buffer:
+Read into your own buffer to bound memory on files that do not fit in RAM. The copy goes straight from the mapped file into it, with no intermediate buffer:
 
 ```python
 buf = np.empty((len(rep0), 44, 15000), dtype=np.complex64)
@@ -77,21 +65,36 @@ for r in np.unique(img.counter("Rep")):
     ...
 ```
 
-The text protocol is parsed per buffer on first access, by attribute or by key:
+The header/text protocol is parsed per buffer on first access, by attribute or by key:
 
 ```python
 f.hdr.Meas.alTR[0]
 f.scan.protocol_name, f.scan.patient_name
 ```
 
-Closing is optional — the mapping is released on garbage collection, and nothing
-turbotwix returns is a view of it, so nothing you hold can go stale. Use `close()` or the
-context manager when you want the descriptor released at a definite point: looping over
-many files, or on Windows, where an open mapping blocks renaming and deleting the `.dat`.
+You can also use a context manager if you want:
 
 ```python
 with tw.open_twix("meas.dat") as f:
     samples = f.read(f.lines.image)
+```
+
+### The data model
+
+A TWIX measurement is a **list of acquisition lines**, each with metadata and a
+`(ncha, ncol)` block of samples. `turbotwix` hands you exactly that: a queryable line table, and reads that return `(ncha, n_lines, ncol)` — channel first, matching its on-disk order, contiguous.
+
+You can query and filter the lines, and when you want it get a numpy array of the data you need
+
+### PMU
+
+Physiological (ECG/pulse/respiration) data interleaved with the acquisition, if any:
+
+```python
+pmu = f.scan.pmu  # empty if this measurement carries no PMU data
+pmu.signal["ECG1"]  # normalized waveform
+pmu.trigger["PULS"]  # matching boolean trigger channel
+pmu.timestamp["ECG1"]  # per-sample clock, 2.5 ms ticks since midnight
 ```
 
 ### Cartesian data
@@ -103,26 +106,53 @@ dense = f.read(dims=("Lin", "Par"))  # (Lin, Par, Cha, Col)
 `read(dims=...)` raises if several lines land on the same grid position — that normally
 means a counter is missing from `dims`, not that the data wants averaging — and names the
 counters responsible. `dims="minimal"` picks the axes for you: the counters that vary,
-minus those the others already determine (`minimal_dims`). That packs the grid, at the
-cost of an axis you may have wanted to slice on, so naming the dims yourself keeps both the
-rank and the memory predictable.
+minus those the others already determine.
 
 ## Correctness
 
-`tests/test_parity.py` checks the extracted samples against pymapvbvd and twixtools:
-line for line and sample for sample against twixtools' `mdb.data`, and `read(dims=...)`
-against pymapvbvd's k-space array. Install the references with `uv sync --group parity`;
-the tests skip otherwise.
+turbotwix is checked against two existing readers:
+- [pymapvbvd](https://github.com/pehses/mapVBVD)
+- [twixtools](https://github.com/pehses/twixtools),  
+
+they are the prior art for this format, and the ground truth `tests/test_parity.py`
+verifies against.
+
+## turbotwix vs. twixtools vs. pymapvbvd
+
+| | turbotwix | twixtools | pymapvbvd |
+|---|---|---|---|
+| Language | Python (numpy, mmap) | Python | Python/MATLAB |
+| Full Cartesian read | fastest (~6x pymapvbvd) | slower | slower |
+| Partial / out-of-core read | yes, mmap-backed, no full load | no, reads the whole file | no, reads the whole file |
+| Line selection / query API | boolean queries over a line table | list of dicts | struct/index based |
+| Slice-geometry parsing | no | yes | no |
+| Ramp-sampling regridding | no | yes | yes |
+| Oversampling removal | no | yes | yes |
+| PMU (ECG/pulse/resp) parsing | yes | yes | no |
+
+turbotwix trades the signal-processing conveniences (regridding, oversampling removal,
+geometry) for raw read speed and the ability to pull a small selection out of a file that
+doesn't fit in RAM. twixtools and pymapvbvd remain the more complete choice when you need
+those conveniences and can afford to load the full measurement.
 
 ## Performance
 
-Reading the image data of a 1 GB page-cache-resident Cartesian file: **0.52 s**, against
-3.13 s for pymapvbvd and 2.21 s for twixtools. The case the design is really for is the one
-a benchmark like that does not show — a selection out of a file far larger than RAM. On a
-25 GiB interleaved spiral measurement the line table costs ~32 ms and one shot ~4 ms, where
-the reference readers must assemble the whole array first.
+Full read of a 234 MB Cartesian measurement, cold page cache, each library in its own
+process (`scripts/bench_read.py`):
 
-The numbers, the methodology and where the speed comes from are in
+| library | time (s) | peak anon (MB) | mmap (MB) | maxrss (MB) |
+|---|---|---|---|---|
+| turbotwix | 0.35 | 140 | 159 | 296 |
+| pymapvbvd | 0.82 | 192 | 38 | 228 |
+| twixtools | 0.69 | 206 | 41 | 242 |
+
+The case this doesn't show is the one the design is really for: a selection out of a file
+far larger than RAM, where the reference readers have no choice but to assemble the whole
+array first. On a 24 GiB interleaved spiral measurement, turbotwix builds the line table in
+~65 ms and pulls a single shot out of it in ~3 ms — pymapvbvd and twixtools have no
+equivalent operation, since without a k-space grid there is nothing partial to fold onto.
+
+The methodology and where the speed comes from are in
 [`docs/implementation.md`](docs/implementation.md).
 
 ## Known limitations
@@ -130,15 +160,16 @@ The numbers, the methodology and where the speed comes from are in
 - A measurement whose line offsets are not 8-byte aligned raises `UnsupportedLayoutError`.
 - Lines of differing `(ncha, ncol)` are tabled together but cannot be read in one call;
   select a single-shaped subset.
-- PMU/SYNCDATA blocks are skipped, not decoded, so they do not appear in the line table.
+- SYNCDATA blocks are not ADC data and never appear in the line table; PMU ones decode
+  separately via `Measurement.pmu`.
 - No ramp-sampling regridding or slice-geometry parsing.
 - No oversampling removal: it is signal processing (an FFT round-trip), and along a
   non-Cartesian readout it is not meaningful.
 
 ## Documentation
 
-- [`docs/twix-format.md`](docs/twix-format.md) — what a `.dat` file contains, byte by byte.
-- [`docs/implementation.md`](docs/implementation.md) — how this reader works and why.
+- [`docs/twix-format.md`](docs/twix-format.md): A candidate explanation of what a `.dat` file contains, byte by byte.
+- [`docs/implementation.md`](docs/implementation.md): The big picture on  how this reader works and why.
 
 ## Development
 
