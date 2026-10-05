@@ -548,7 +548,7 @@ class LineTable:
         return value
 
     def counter(self, name: str) -> np.ndarray:
-        """One loop counter's value for every line.
+        """One loop counter's value for every line, unwrapped past its uint16 range.
 
         Parameters
         ----------
@@ -558,9 +558,15 @@ class LineTable:
         Returns
         -------
         numpy.ndarray
-            The `(N,)` int64 counter values.
+            The `(N,)` int64 counter values, unwrapped.
         """
-        return self.rows["counters"][name].astype(np.int64)
+        raw = self.rows["counters"][name]
+        values = raw.astype(np.int64)
+        if len(raw) > 1:
+            wrapped = (raw[:-1] == 65535) & (raw[1:] < raw[:-1])
+            if wrapped.any():
+                values[1:] += np.cumsum(wrapped) * 65536
+        return values
 
     def size(self, name: str) -> int:
         """Grid extent of one loop counter: `max - min + 1`, its declared axis size.
